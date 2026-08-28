@@ -1,0 +1,4128 @@
+/**
+ * Door Number Builder Suitelet — GEN-Y DOOR
+ * File: GNY_DoorNumberBuilder_Suitelet.js
+ * Script Type: Suitelet
+ * API Version: 2.1
+ *
+ * Sibling of GNY_PartNumberBuilder_Suitelet.js (GEN-Y HITCH). Same shell —
+ * NetSuite chrome, one INLINEHTML field, everything scoped under #gny-dnb,
+ * one part-number field that doubles as the search box, rollback on failure,
+ * recent-activity rail. The BUILD is what differs, and it differs a lot.
+ *
+ * WHAT A DOOR IS IN THIS ACCOUNT
+ *   A door is not one item. It is a FAMILY of items sharing one 7-digit
+ *   sequence number, all sitting at location 48 (GEN-Y DOOR):
+ *
+ *     DR-{series}-{number}   the finished door.  Sellable.  NO ROUTING.
+ *     F-{series}-{number}    FRAME.        BOM + revision + routing.
+ *     C-{series}-{number}    CORE.         BOM + revision + routing.
+ *     S-{series}-{number}    SCREEN DOOR.  BOM + revision + routing. Optional.
+ *
+ *   The DR BOM consumes F, C and (when present) S, plus any loose hardware
+ *   that isn't part of a sub-assembly. Verified against 1,149 live families;
+ *   only 101 of 3,183 doors carry a screen, which is why it's a checkbox
+ *   rather than always-on.
+ *
+ *   So ONE submit here creates up to 15 records: 4 items, 4 BOMs,
+ *   4 revisions, 3 routings. If any of them fails, all of them are rolled
+ *   back — a half-built door family is worse than no door family.
+ *
+ * DESCRIPTION CASCADE
+ *   You type the description ONCE, on the door. The sub-assemblies derive:
+ *     DR  ->  "4500 ENT SQ SD LH WB 36 x 74 ML 950 ..."
+ *     C   ->  "CORE " + that
+ *     F   ->  "FRAME " + that
+ *     S   ->  "SCREEN DOOR " + that
+ *   1,023 of 1,149 live families match that rule exactly; the other 126 are
+ *   hand-typing drift (PSWHT vs PS WH and similar), not a different rule.
+ *   The description also opens with the series number on 3,126 of 3,182
+ *   doors, so the series you pick is prepended for you — see SERIES_IN_DESC.
+ *
+ * NUMBERING
+ *   The sequence is GLOBAL, not per series. DR-4500-1002211 and
+ *   DR-6000-1002207 come off the same counter. The next number is looked up
+ *   live on page load and on every reset, so two people building at once see
+ *   different numbers as soon as the first one saves. It stays editable —
+ *   the lookup is a suggestion, and the duplicate check is what actually
+ *   protects you.
+ *
+ * ROUTING — COST TEMPLATE DEPENDS ON THE FAMILY, NOT THE OPERATION
+ *   This is the one thing a straight copy of the hitch builder gets wrong.
+ *   EXT CUT is a real operation on both frames and cores, but it costs
+ *   differently:
+ *     FRAME / SCREEN   EXT CUT -> DR Frame Cutting     (1,233 live steps)
+ *     CORE             EXT CUT -> DR Core Framing      (1,124 live steps)
+ *   Same story for EXT BEND (DR Frame Bending vs DR Core Framing). So the
+ *   operation catalog is keyed by family, and each grid only offers the
+ *   operations that family actually runs.
+ *
+ *   Defaults, taken from what the shop actually does:
+ *     FRAME   1 EXT CUT, 2 EXT WELD           (716 of 1,132; bend is the rest)
+ *     CORE    1 EXT CUT, 2 LAMINATION, 3 ROUTING   (691; +bend variant is 439)
+ *     SCREEN  1 EXT CUT                       (68 of 101; 33 add a bend)
+ *   Run rate 5, setup 0 on every single door routing step in the account —
+ *   6,307 of them, no exceptions. Both fields stay editable anyway.
+ *
+ *   NOTE the cost template "DR  Core Lamination" carries a DOUBLE SPACE in
+ *   its name. Name matching collapses whitespace, or that step silently
+ *   saves with no cost template.
+ *
+ * TEMPLATES
+ *   Three template items already exist and are cloned per family:
+ *     DR-4000-TEMPLATE (30411), F-4000-TEMPLATE (30412), C-4000-TEMPLATE (30413)
+ *   There is no S- template. Screens carry field-for-field identical values
+ *   to frames on all 102 live examples, so S clones the F template. To change
+ *   what new doors default to, edit those items in NetSuite, not this script.
+ *
+ * WHAT IS DELIBERATELY NOT HERE
+ *   No weight, no shipping dimensions, no Order Tracking Sorter, no coated
+ *   finish split — none of them are populated on any door item. Component
+ *   yield is off on all 3,556 door BOMs. Use Bins is off. Doors carry
+ *   custitemcut_details instead, a free-text cut list present on 2,451 of
+ *   3,183 doors, which has no hitch equivalent and gets its own box.
+ *
+ * DEPLOY
+ *   1. Upload to File Cabinet (e.g. SuiteScripts/)
+ *   2. Script record -> type: Suitelet -> point to this file
+ *   3. Deployment -> Status: Released, Audience: as appropriate
+ *      (needs create permission on Item, BOM, BOM Revision, Mfg Routing)
+ *   4. Load the page — the banner confirms the field counts read off each
+ *      template and the next free door number. Reload with ?refresh=1 to
+ *      drop cached dropdown data without waiting out the TTL.
+ */
+
+/**
+ * @NApiVersion 2.1
+ * @NScriptType Suitelet
+ * @NModuleScope SameAccount
+ */
+define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/format', 'N/cache'],
+(serverWidget, query, search, record, log, format, nsCache) => {
+
+  // ─── CONFIG ───────────────────────────────────────────────────────────────
+  const CFG = {
+    // One template per family. S has no template of its own — every one of the
+    // 102 live screens matches its frame field for field, so it clones F.
+    TEMPLATE_ITEMS: {
+      DR: '30411',   // DR-4000-TEMPLATE
+      F:  '30412',   // F-4000-TEMPLATE
+      C:  '30413',   // C-4000-TEMPLATE
+      S:  '30412'    // no S template exists; frame is the correct stand-in
+    },
+
+    // GEN-Y DOOR. Written to both `location` and `preferredlocation` — every
+    // one of the 5,588 live door items carries both, and it is the only
+    // reliable "this is a door part" marker in the data (the DR-/C-/F-/S-
+    // prefixes are convention, the location is a field).
+    LOCATION_ID: '48',
+    LOCATION_NAME: 'GEN-Y DOOR',
+    SET_PREFERRED_LOCATION: true,
+
+    // Falls back to this only if the template items don't supply it.
+    SUBSIDIARY_ID: '2',        // GENY GROUP : GEN-Y HITCH
+
+    // Screens are 101 of 3,183 doors — off by default, checkbox on the form.
+    INCLUDE_SCREEN_DEFAULT: false,
+
+    // Item source for the F / C / S lines on the DOOR's own BOM.
+    // The data is split: 3,560 lines are WORK_ORDER (the long-standing
+    // convention) and 2,415 are STOCK (a March 2026 batch). WORK_ORDER is the
+    // default here because it's the majority and because it's what makes the
+    // sub-assembly actually get built. Every row's dropdown stays editable.
+    DR_SUBASSEMBLY_SOURCE: 'WORK_ORDER',
+
+    // Order the sub-assemblies land on the door's BOM. Matches the most
+    // recent live batch (S, F, C). Loose hardware follows underneath.
+    DR_COMPONENT_ORDER: ['S', 'F', 'C'],
+
+    // Door BOMs are ALWAYS scoped to their one assembly — all 3,556 of them
+    // have availableforallassemblies = F. This is the opposite of the hitch
+    // builder's default and costs an extra load+save per BOM, but matching
+    // the account's convention is worth more than the second or two.
+    RESTRICT_BOM_TO_ASSEMBLY: true,
+    BOM_RESTRICT_SUBLISTS: ['restricttoassemblies', 'assembly', 'bomassembly'],
+
+    // Clear the form after a successful build so the next door can be typed
+    // straight away. The next number is re-fetched as part of the reset.
+    AUTO_RESET: true,
+
+    RECENT_LIMIT: 15,
+
+    // Revision effective date offset from today, in days. -1 = yesterday.
+    // Also drives "New BOM Rev" dating in edit mode.
+    EFFECTIVE_DATE_OFFSET_DAYS: -1,
+
+    // ── Performance ────────────────────────────────────────────────────
+    // BUMP CACHE_NAME WHENEVER A LIST QUERY CHANGES. The cache is PUBLIC
+    // scope with an hour TTL, so a corrected query keeps serving the OLD
+    // result until the TTL expires.
+    USE_CACHE: true,
+    CACHE_NAME: 'gny_dnb_v1',
+    CACHE_TTL_LISTS: 3600,
+    CACHE_TTL_TEMPLATE: 1800,
+
+    CACHE_KEYS: ['workcenters', 'costtemplates', 'classes'],
+
+    // Sourcing re-derives dependent fields on save. Every field a new door
+    // needs is copied explicitly off its template, so sourcing mostly redoes
+    // finished work — and this tool saves up to 15 records per submit, so the
+    // saving compounds. If a new door comes out missing a field that isn't on
+    // the template, set this back to true.
+    ENABLE_SOURCING: false,
+
+    LOG_TIMINGS: true,
+
+    SEARCH_MIN_CHARS: 3,
+    SEARCH_ROWS: 15,
+
+    // Doors are built almost entirely from 99xxx raw stock. Restricting the
+    // component search to inventory + assembly keeps service items and
+    // non-inventory charges out of the dropdown.
+    SEARCH_ITEM_TYPES: ['InvtPart', 'Assembly', 'NonInvtPart', 'Kit'],
+
+    // ── Door identity ──────────────────────────────────────────────────
+    FAMILY_PREFIX: { DR: 'DR-', F: 'F-', C: 'C-', S: 'S-' },
+
+    // Prepended to the typed description for each sub-assembly. DR takes the
+    // description raw.
+    DESC_PREFIX: { DR: '', F: 'FRAME ', C: 'CORE ', S: 'SCREEN DOOR ' },
+
+    // DR revisions are named "... BOM REV-A" (1,151 live), C/F/S are named
+    // "... BOM REV A" (2,404 live). Not a typo on either side — they were
+    // created by different processes and both are still in use.
+    REV_NAME_SEP: { DR: ' BOM REV-', F: ' BOM REV ', C: ' BOM REV ', S: ' BOM REV ' },
+
+    // The door itself has no routing. Zero of 3,183 DR items have one — the
+    // work happens on the frame and the core, and the door is the marriage.
+    BUILDS_ROUTING: { DR: false, F: true, C: true, S: true },
+
+    // Door numbers are 7 digits and currently run 10xxxxx. Zero-padded to
+    // this width when the next number is suggested.
+    NUMBER_WIDTH: 7,
+
+    // The description opens with the series number on 3,126 of 3,182 doors.
+    // Turn off if you'd rather type it yourself.
+    SERIES_IN_DESC: true,
+
+    // Door-only free-text cut list — Outer W/H, Inner W/H, Panel W/H,
+    // Screen W/H, H-Bar. Lives on the DR item only (2,451 of 3,183 carry it;
+    // 6 of 5,588 sub-assemblies do, which is drift, not a convention).
+    CUT_DETAILS_FIELD: 'custitemcut_details',
+
+    // Door line / product line. Populated on only 209 doors, so it is offered
+    // but never required.
+    DOOR_LINE_FIELD: 'custitem_door_line',
+
+    // Auto-Issue on BOM revision components. The sublist field ID varies by
+    // account; candidates are tried in order and the one that sticks is
+    // reused for the remaining lines.
+    AUTO_ISSUE_DEFAULT: true,
+    AUTO_ISSUE_FIELDS: ['autoissuecomponent', 'isautoissue', 'autoissue', 'autoissuecomp'],
+
+    // Components can be tied to a routing step by Operation Sequence Number.
+    // Drop a step whose sequence a component still points at and NetSuite
+    // refuses the save. Not exposed in SuiteQL, so it's resolved off the
+    // record the same way AUTO_ISSUE_FIELDS is.
+    COMPONENT_OPSEQ_FIELDS: [
+      'operationsequencenumber', 'componentoperationsequencenumber',
+      'opsequencenumber', 'operationsequence'
+    ],
+
+    // Where the description is written. Confirmed on live door items: all
+    // four carry the same text. Excluded from template inheritance so the
+    // template's own text can never ride along.
+    DESCRIPTION_FIELDS: ['description', 'salesdescription', 'displayname', 'purchasedescription'],
+
+    // Never copied from a template. Everything else is — including the
+    // accounts, tax schedule, units, costing method and every custitem_*.
+    SKIP_FIELDS: [
+      'itemid', 'displayname', 'id', 'internalid', 'externalid', 'upccode',
+      'recordtype', 'isinactive', 'subsidiary',
+      'createddate', 'lastmodifieddate', 'lastquantityavailablechange',
+      'quantityonhand', 'quantityavailable', 'quantitybackordered',
+      'quantitycommitted', 'quantityonorder', 'quantityintransit',
+      'onhandvaluemli', 'totalvalue', 'averagecost', 'lastpurchaseprice',
+      'costestimate', 'reorderpoint', 'preferredstocklevel',
+      'buildtime', 'totalquantityonhand',
+      // Door-specific: the cut list and door line belong to ONE door, not to
+      // every door cloned off the template.
+      'custitemcut_details', 'custitem_door_line'
+    ],
+
+    // Door work centers are entity GROUPS with grouptype 'Employee' — the
+    // same quirk the hitch builder documents. Only three of them exist.
+    WORK_CENTER_NAME_PATTERNS: ['DOOR -%', 'DOOR-%'],
+    WORK_CENTER_EXCLUDE: [],
+
+    // Cost templates shown in the routing dropdowns. Everything else in the
+    // account is hitch or aluminum and would only be noise.
+    COST_TEMPLATE_PATTERNS: ['DR %', 'DR  %', 'DOOR %'],
+
+    // Skip the prefilled fields when tabbing, so Tab runs
+    // Series -> Number -> Description -> first component.
+    SKIP_TAB_ON_PREFILLED: true,
+
+    HIDE_NS_PAGE_TITLE: true
+  };
+
+  // Which families a build touches, in creation order. Sub-assemblies first —
+  // the door's BOM needs their internal IDs.
+  const BUILD_ORDER = ['F', 'C', 'S', 'DR'];
+  const ALL_FAMILIES = ['DR', 'F', 'C', 'S'];
+
+  const FAMILY_LABEL = {
+    DR: 'Door', F: 'Frame', C: 'Core', S: 'Screen door'
+  };
+
+  // Door series in use, with the item class each one maps to. Taken from the
+  // 3,183 live doors: the dominant class per series, ignoring the handful of
+  // miskeyed outliers (one 6000-series door filed under 4000 SERIES, etc).
+  // Class is matched BY NAME at runtime so Sandbox and Production internal
+  // IDs can differ without breaking anything.
+  const SERIES = [
+    { code: '1201', cls: '12010 SERIES' },
+    { code: '1302', cls: '1302 SERIES CONCESSION' },
+    { code: '1325', cls: '1325 SERIES CONCESSION' },
+    { code: '1500', cls: '1500 SERIES' },
+    { code: '1520', cls: '1500 SERIES' },
+    { code: '1550', cls: '1500 SERIES' },
+    { code: '1600', cls: '1600' },
+    { code: '2000', cls: '2000 SERIES' },
+    { code: '2050', cls: '2000 SERIES' },
+    { code: '2500', cls: '2000 SERIES' },
+    { code: '2800', cls: '2000 SERIES' },
+    { code: '3000', cls: '3000 SERIES' },
+    { code: '3010', cls: '3000 SERIES' },
+    { code: '3500', cls: '3000 SERIES' },
+    { code: '3750', cls: '3000 SERIES' },
+    { code: '4000', cls: '4000 SERIES' },
+    { code: '4010', cls: '4000 SERIES' },
+    { code: '4050', cls: '4000 SERIES' },
+    { code: '4100', cls: '4000 SERIES' },
+    { code: '4250', cls: '4000 SERIES' },
+    { code: '4500', cls: '4000 SERIES' },
+    { code: '4750', cls: '4000 SERIES' },
+    { code: '5000', cls: '4000 SERIES' },
+    { code: '5250', cls: '4000 SERIES' },
+    { code: '6000', cls: '6000 SERIES' },
+    { code: '6010', cls: '6000 SERIES' },
+    { code: '6050', cls: '6000 SERIES' },
+    { code: '6250', cls: '6000 SERIES' },
+    { code: '7050', cls: '7250 SERIES' },
+    { code: '7250', cls: '7250 SERIES' },
+    { code: '8050', cls: '8000 SERIES' },
+    { code: '9500', cls: '9500 SERIES ENT' }
+  ];
+
+  // The shop's door operation catalog, keyed by family. Picking an operation
+  // fills sequence, work center, cost template, run rate and setup. Work
+  // centers and cost templates are matched by NAME so SB and PROD internal
+  // IDs can differ.
+  //
+  // Read straight off 6,307 live routing steps. The cost template split
+  // between frame and core is real and is the whole reason this is a map
+  // rather than one flat list:
+  //   EXT CUT on a frame  = DR Frame Cutting   (1,132 F + 101 S)
+  //   EXT CUT on a core   = DR Core Framing    (1,124 C)
+  //   EXT BEND on a frame = DR Frame Bending   (416 F + 33 S)
+  //   EXT BEND on a core  = DR Core Framing    (430 C)
+  // Run rate 5 / setup 0 appears on every one of those 6,307 steps.
+  const OPERATIONS = {
+    F: [
+      { op: 'EXT CUT',  seq: 1, wc: 'Door - Core Framing', ct: 'DR Frame Cutting', run: 5, setup: 0 },
+      { op: 'EXT WELD', seq: 2, wc: 'Door - Core Framing', ct: 'DR Frame Welding', run: 5, setup: 0 },
+      { op: 'EXT BEND', seq: 2, wc: 'Door - Core Framing', ct: 'DR Frame Bending', run: 5, setup: 0 }
+    ],
+    C: [
+      { op: 'EXT CUT',    seq: 1, wc: 'Door - Core Framing',    ct: 'DR Core Framing',    run: 5, setup: 0 },
+      { op: 'EXT BEND',   seq: 2, wc: 'Door - Core Framing',    ct: 'DR Core Framing',    run: 5, setup: 0 },
+      // Double space in "DR  Core Lamination" is how the record is actually
+      // named. Name matching collapses whitespace, so this still resolves.
+      { op: 'LAMINATION', seq: 2, wc: 'Door - Core Lamination', ct: 'DR  Core Lamination', run: 5, setup: 0 },
+      { op: 'ROUTING',    seq: 3, wc: 'Door - Core Routing',    ct: 'DR Core Routing',    run: 5, setup: 0 },
+      // 10 live cores weld instead of bending. Rare, but real.
+      { op: 'EXT WELD',   seq: 2, wc: 'Door - Core Framing',    ct: 'DR Frame Welding',   run: 5, setup: 0 }
+    ],
+    S: [
+      { op: 'EXT CUT',  seq: 1, wc: 'Door - Core Framing', ct: 'DR Frame Cutting', run: 5, setup: 0 },
+      { op: 'EXT BEND', seq: 2, wc: 'Door - Core Framing', ct: 'DR Frame Bending', run: 5, setup: 0 },
+      { op: 'EXT WELD', seq: 2, wc: 'Door - Core Framing', ct: 'DR Frame Welding', run: 5, setup: 0 }
+    ]
+  };
+
+  // Which steps a brand new family starts with. The most common live shape,
+  // not a guess — rows are added and removed like any other.
+  const DEFAULT_STEPS = {
+    F: ['EXT CUT', 'EXT WELD'],
+    C: ['EXT CUT', 'LAMINATION', 'ROUTING'],
+    S: ['EXT CUT']
+  };
+
+  // How many blank component rows each family opens with. Frames run about 3
+  // lines, cores 6-11, screens 8-10, and the door itself usually adds no
+  // loose hardware at all beyond the sub-assemblies.
+  const DEFAULT_COMPONENT_ROWS = { DR: 1, F: 3, C: 6, S: 4 };
+
+  const WRAP = 'gny-dnb';
+  const NS_ITEM = '/app/common/item/item.nl?id=';
+
+  let _cacheCleared = false;
+
+  const ITEM_SOURCES = [
+    { v: 'STOCK',          l: 'Stock' },
+    { v: 'WORK_ORDER',     l: 'Work Order' },
+    { v: 'PHANTOM',        l: 'Phantom' },
+    { v: 'PURCHASE_ORDER', l: 'Purchase Order' }
+  ];
+
+  // Item source is chosen from the component's own item type when it's picked.
+  // Doors are built almost entirely from purchased stock; the only assemblies
+  // that appear as components are the sub-assemblies this tool creates.
+  const SOURCE_BY_ITEMTYPE = {
+    'Assembly':     'WORK_ORDER',
+    'InvtPart':     'STOCK',
+    'NonInvtPart':  'STOCK',
+    'Kit':          'STOCK',
+    'Service':      'STOCK',
+    'OthCharge':    'STOCK'
+  };
+  const SOURCE_FALLBACK = 'STOCK';
+
+  // ─── ENTRY POINT ──────────────────────────────────────────────────────────
+  const onRequest = (ctx) => {
+    const { request, response } = ctx;
+
+    if (request.method === 'POST') {
+      response.setHeader({ name: 'Content-Type', value: 'application/json; charset=utf-8' });
+      let result;
+      try {
+        const body = JSON.parse(request.body || '{}');
+        const action = body.action || 'build';
+        if (action === 'build')             result = buildDoor(body);
+        else if (action === 'updateFields') result = updateDoor(body, false);
+        else if (action === 'newBomRev')    result = updateDoor(body, true);
+        else result = { ok: false, message: 'Unknown action: ' + action };
+      } catch (e) {
+        log.error({ title: 'POST fatal', details: e.toString() + ' | ' + (e.stack || '') });
+        result = { ok: false, message: e.message || String(e) };
+      }
+      response.write(JSON.stringify(result));
+      return;
+    }
+
+    const api = request.parameters.api || '';
+    if (api) {
+      response.setHeader({ name: 'Content-Type', value: 'application/json; charset=utf-8' });
+      response.write(JSON.stringify(handleApi(api, request.parameters)));
+      return;
+    }
+
+    if (request.parameters.refresh) clearListCaches();
+    response.writePage(buildForm());
+  };
+
+  function clearListCaches() {
+    _defaultsCache = {};
+    _cacheCleared = true;
+    if (!CFG.USE_CACHE) return [];
+    const cleared = [];
+    try {
+      const c = nsCache.getCache({ name: CFG.CACHE_NAME, scope: nsCache.Scope.PUBLIC });
+      const keys = (CFG.CACHE_KEYS || []).slice();
+      for (const k in CFG.TEMPLATE_ITEMS) {
+        const key = 'tpl_' + CFG.TEMPLATE_ITEMS[k];
+        if (keys.indexOf(key) === -1) keys.push(key);
+      }
+      for (const k of keys) {
+        try { c.remove({ key: k }); cleared.push(k); }
+        catch (e) { log.audit({ title: 'cache remove failed', details: k + ': ' + e.toString() }); }
+      }
+      log.audit({ title: 'caches cleared', details: cleared.join(', ') || '(none)' });
+    } catch (e) {
+      log.error({ title: 'clearListCaches', details: e.toString() });
+    }
+    return cleared;
+  }
+
+  // ─── FORM (NetSuite-chrome rendering) ─────────────────────────────────────
+  function buildForm() {
+    const form = serverWidget.createForm({ title: 'Door Number Builder' });
+
+    let html;
+    try {
+      html = buildInlineHtml();
+    } catch (e) {
+      log.error({ title: 'buildInlineHtml fatal', details: e.toString() + ' | ' + (e.stack || '') });
+      html =
+        '<div id="' + WRAP + '">' +
+        '<div style="font-family:system-ui;padding:24px;max-width:720px">' +
+        '<h2 style="color:#a02020;margin-bottom:8px">Door Number Builder could not load</h2>' +
+        '<p style="font-family:monospace;background:#fff0f0;border:1px solid #ffaaaa;' +
+        'padding:12px;border-radius:5px">' + escHtml(e.message || String(e)) + '</p>' +
+        '<p style="margin-top:8px">Full detail is in the script execution log.</p>' +
+        '</div></div>';
+    }
+
+    const field = form.addField({
+      id: 'custpage_gny_dnb_html',
+      type: serverWidget.FieldType.INLINEHTML,
+      label: 'Door Number Builder'
+    });
+    field.updateLayoutType({ layoutType: serverWidget.FieldLayoutType.OUTSIDEBELOW });
+    field.updateBreakType({ breakType: serverWidget.FieldBreakType.STARTROW });
+    field.defaultValue = html;
+
+    return form;
+  }
+
+  // ─── CACHE ────────────────────────────────────────────────────────────────
+  function reviveDates(v) {
+    if (v && typeof v === 'object' && typeof v.__d === 'string') return new Date(v.__d);
+    return v;
+  }
+
+  function cached(key, ttl, producer) {
+    if (!CFG.USE_CACHE) return producer();
+    try {
+      const c = nsCache.getCache({ name: CFG.CACHE_NAME, scope: nsCache.Scope.PUBLIC });
+      const raw = c.get({
+        key: key,
+        ttl: ttl,
+        loader: () => {
+          const v = producer();
+          // Never persist emptiness. One transient query failure would
+          // otherwise poison a dropdown for the whole TTL.
+          if (!v || (Array.isArray(v) && !v.length)) return '';
+          return JSON.stringify(v, dateReplacer);
+        }
+      });
+      if (!raw) return producer();
+      const parsed = JSON.parse(raw, (k, v) => reviveDates(v));
+      if (Array.isArray(parsed) && !parsed.length) return producer();
+      return parsed;
+    } catch (e) {
+      log.audit({ title: 'cache miss/fail for ' + key, details: e.toString() });
+      return producer();
+    }
+  }
+
+  // JSON.stringify calls toJSON() on Dates BEFORE the replacer sees them, so
+  // an `instanceof Date` check inside the replacer never fires. Detecting the
+  // shape on the original object is what actually works.
+  function dateReplacer(key, value) {
+    if (this && this[key] instanceof Date) return { __d: this[key].toISOString() };
+    return value;
+  }
+
+  // ─── READ-ONLY API ENDPOINTS ──────────────────────────────────────────────
+  function handleApi(api, params) {
+    try {
+      if (api === 'items')         return searchItems(params.term || '');
+      if (api === 'workcenters')   return listWorkCenters();
+      if (api === 'costtemplates') return listCostTemplates();
+      if (api === 'classes')       return listClasses();
+      if (api === 'nextnumber')    return { number: nextDoorNumber() };
+      if (api === 'checkdoor')     return checkDoorNumber(params.term || '');
+      if (api === 'loaddoor')      return loadDoorForEdit(params.term || '');
+      if (api === 'doors')         return searchDoors(params.term || '');
+    } catch (e) {
+      log.error({ title: 'api ' + api, details: e.toString() + ' | ' + (e.stack || '') });
+    }
+    return [];
+  }
+
+  function sq(str) { return String(str || '').replace(/'/g, "''"); }
+
+  // Collapses runs of whitespace before comparing. "DR  Core Lamination" is
+  // the real name of a real cost template, double space and all, and a naive
+  // exact match against "DR Core Lamination" silently misses it.
+  function normName(s) {
+    return String(s == null ? '' : s).replace(/\s+/g, ' ').trim().toUpperCase();
+  }
+
+  // Two-pass component search. Prefix match on itemid is cheap and indexed and
+  // covers how people search (they type the start of a stock number). The
+  // description scan is a full wildcard and only runs if the first pass is thin.
+  function searchItems(term) {
+    if (!term || term.length < CFG.SEARCH_MIN_CHARS) return [];
+    const safe = sq(term).toUpperCase();
+    const rows = CFG.SEARCH_ROWS;
+    const types = (CFG.SEARCH_ITEM_TYPES || []).map(t => "'" + sq(t) + "'").join(',');
+    const typeFilter = types ? ` AND itemtype IN (${types})` : '';
+    const seen = {};
+    const out = [];
+
+    function collect(sql) {
+      let rs = [];
+      try { rs = query.runSuiteQL({ query: sql }).asMappedResults(); }
+      catch (e) { log.audit({ title: 'searchItems variant failed', details: e.toString() }); }
+      for (const r of rs) {
+        if (seen[r.id]) continue;
+        seen[r.id] = true;
+        out.push({ id: r.id, itemid: r.itemid, desc: r.displayname || '', type: r.itemtype || '' });
+      }
+    }
+
+    collect(`SELECT id, itemid, displayname, itemtype
+             FROM item
+             WHERE isinactive = 'F' AND UPPER(itemid) LIKE '${safe}%'${typeFilter}
+             ORDER BY itemid
+             FETCH FIRST ${rows} ROWS ONLY`);
+
+    if (out.length < rows) {
+      collect(`SELECT id, itemid, displayname, itemtype
+               FROM item
+               WHERE isinactive = 'F' AND UPPER(displayname) LIKE '%${safe}%'${typeFilter}
+               ORDER BY itemid
+               FETCH FIRST ${rows} ROWS ONLY`);
+    }
+
+    return out.slice(0, rows);
+  }
+
+  // Powers the door search box. Only DR- items, because that's the number a
+  // person thinks in — picking one loads the whole family.
+  function searchDoors(term) {
+    if (!term) return [];
+    const safe = sq(term).toUpperCase();
+    const rows = CFG.SEARCH_ROWS;
+    const out = [];
+    try {
+      const rs = query.runSuiteQL({
+        query: `SELECT id, itemid, displayname
+                FROM item
+                WHERE UPPER(itemid) LIKE 'DR-%${safe}%'
+                ORDER BY itemid
+                FETCH FIRST ${rows} ROWS ONLY`
+      }).asMappedResults();
+      for (const r of rs) out.push({ id: r.id, itemid: r.itemid, desc: r.displayname || '' });
+    } catch (e) {
+      log.audit({ title: 'searchDoors failed', details: e.toString() });
+    }
+    return out;
+  }
+
+  // The next free door number. GLOBAL across every series and every family —
+  // DR-4500-1002211 and DR-6000-1002207 come off the same counter, so the max
+  // has to be taken across all four prefixes, not just DR.
+  //
+  // Deliberately NOT cached. A stale suggestion here means two people build
+  // onto the same number, and the duplicate check turns that into a confusing
+  // failure instead of a smooth one.
+  function nextDoorNumber() {
+    let max = 0;
+    try {
+      const rows = query.runSuiteQL({
+        query: `SELECT MAX(TO_NUMBER(REGEXP_SUBSTR(itemid, '[0-9]+$'))) AS maxnum
+                FROM item
+                WHERE REGEXP_LIKE(itemid, '^(DR|C|F|S)-[0-9]+-[0-9]{7}$')`
+      }).asMappedResults();
+      max = parseInt(rows[0] && rows[0].maxnum, 10) || 0;
+    } catch (e) {
+      log.error({ title: 'nextDoorNumber', details: e.toString() });
+      return '';
+    }
+    if (!max) return '';
+    return padNumber(max + 1);
+  }
+
+  function padNumber(n) {
+    let s = String(n);
+    while (s.length < CFG.NUMBER_WIDTH) s = '0' + s;
+    return s;
+  }
+
+  // Builds the four part numbers a given series + number resolves to.
+  function familyNumbers(series, number) {
+    const out = {};
+    const tail = String(series).trim() + '-' + String(number).trim();
+    for (const f of ALL_FAMILIES) out[f] = CFG.FAMILY_PREFIX[f] + tail;
+    return out;
+  }
+
+  // Checks several part numbers in ONE query. Four separate round trips for a
+  // door family is four waits for the same answer.
+  function checkPartNumbers(nums) {
+    const list = nums.filter(n => n).map(n => "'" + sq(n).toUpperCase() + "'");
+    if (!list.length) return {};
+    const found = {};
+    try {
+      query.runSuiteQL({
+        query: `SELECT id, itemid FROM item WHERE UPPER(itemid) IN (${list.join(',')})`
+      }).asMappedResults().forEach(r => {
+        found[String(r.itemid).trim().toUpperCase()] = r.id;
+      });
+    } catch (e) {
+      log.error({ title: 'checkPartNumbers', details: e.toString() });
+    }
+    return found;
+  }
+
+  // Answers "is this door number free, and if not, what already exists on it?"
+  // Accepts either a bare number (1002212) or a full DR- part number.
+  function checkDoorNumber(term) {
+    const parsed = parseDoorTerm(term);
+    if (!parsed) return { ok: false, message: 'Enter a door number.' };
+
+    // A bare number with no series can't name a part, but it can still tell
+    // you whether that number is taken anywhere.
+    if (!parsed.series) {
+      let hit = null;
+      try {
+        const rows = query.runSuiteQL({
+          query: `SELECT itemid FROM item
+                  WHERE REGEXP_LIKE(itemid, '^DR-[0-9]+-${sq(parsed.number)}$')`
+        }).asMappedResults();
+        hit = rows[0] ? rows[0].itemid : null;
+      } catch (e) { /* fall through to "free" */ }
+      return hit
+        ? { ok: true, exists: true, doorNumber: hit, number: parsed.number }
+        : { ok: true, exists: false, number: parsed.number };
+    }
+
+    const nums = familyNumbers(parsed.series, parsed.number);
+    const found = checkPartNumbers(ALL_FAMILIES.map(f => nums[f]));
+    const existing = {};
+    let any = false;
+    for (const f of ALL_FAMILIES) {
+      const id = found[nums[f].toUpperCase()];
+      if (id) { existing[f] = id; any = true; }
+    }
+    return {
+      ok: true,
+      exists: any,
+      hasDoor: !!existing.DR,
+      existing: existing,
+      numbers: nums,
+      series: parsed.series,
+      number: parsed.number,
+      doorNumber: nums.DR
+    };
+  }
+
+  // Accepts "1002212", "DR-4500-1002212", "4500-1002212", "C-4500-1002212".
+  // Returns { series, number } with series possibly blank.
+  function parseDoorTerm(term) {
+    const t = String(term || '').trim().toUpperCase();
+    if (!t) return null;
+    let m = t.match(/^(?:DR|C|F|S)-([0-9]+)-([0-9]+)$/);
+    if (m) return { series: m[1], number: m[2] };
+    m = t.match(/^([0-9]{3,5})-([0-9]{4,})$/);
+    if (m) return { series: m[1], number: m[2] };
+    m = t.match(/^([0-9]+)$/);
+    if (m) return { series: '', number: m[1] };
+    return null;
+  }
+
+  function tryQueries(candidates, label) {
+    for (const c of candidates) {
+      try {
+        const rows = query.runSuiteQL({ query: c.sql }).asMappedResults();
+        if (rows && rows.length) return rows.map(c.map);
+      } catch (e) {
+        log.audit({ title: label + ' — query variant failed', details: e.toString() });
+      }
+    }
+    log.error({ title: label + ' — no variant returned rows', details: 'dropdown will be empty' });
+    return [];
+  }
+
+  // Like tryQueries, but UNIONs every variant by internal ID instead of
+  // stopping at the first that returns anything. Entries flagged `weak` carry
+  // a placeholder name and are overwritten the moment any variant supplies a
+  // real one for that ID.
+  function mergeQueries(candidates, label) {
+    const byId = {};
+    const report = [];
+
+    for (const c of candidates) {
+      let rows = [];
+      try {
+        rows = query.runSuiteQL({ query: c.sql }).asMappedResults() || [];
+      } catch (e) {
+        report.push(c.tag + '=ERR');
+        log.audit({ title: label + ' — variant ' + c.tag + ' failed', details: e.toString() });
+        continue;
+      }
+
+      let added = 0, upgraded = 0;
+      for (const r of rows) {
+        let m;
+        try { m = c.map(r); } catch (e) { continue; }
+        if (!m || !m.id) continue;
+        const k = String(m.id);
+        const existing = byId[k];
+        if (!existing) {
+          byId[k] = { id: k, name: m.name, weak: !!c.weak };
+          added++;
+        } else if (existing.weak && !c.weak && m.name) {
+          existing.name = m.name;
+          existing.weak = false;
+          upgraded++;
+        }
+      }
+      report.push(c.tag + '=' + rows.length + (added ? ' +' + added : '') +
+                  (upgraded ? ' ^' + upgraded : ''));
+    }
+
+    const out = [];
+    for (const k in byId) out.push({ id: byId[k].id, name: byId[k].name });
+    out.sort((a, b) => normName(a.name) < normName(b.name) ? -1 : 1);
+
+    log.audit({
+      title: label + ' — merged ' + out.length + ' rows',
+      details: report.join('  ') || '(no variants ran)'
+    });
+    if (!out.length) {
+      log.error({ title: label + ' — every variant came back empty', details: 'dropdown will be empty' });
+    }
+    return out;
+  }
+
+  // The three door work centers are entity GROUPS carrying grouptype
+  // 'Employee', not the 'MfgWorkCenter' the SuiteQL docs imply — same trap the
+  // hitch builder documents. Every angle runs and the results are merged, so
+  // one working variant is enough.
+  //
+  //   byUsage — groups referenced by a routing step that already runs a door
+  //             cost template. Sturdiest: no grouptype, no name guessing.
+  //   byName  — name prefixes, for a centre not yet on any routing.
+  //   byType* — grouptype filters, for accounts that do expose it.
+  function listWorkCenters() {
+    return cached('workcenters', CFG.CACHE_TTL_LISTS, () => {
+      const patterns = (CFG.WORK_CENTER_NAME_PATTERNS || [])
+        .map(p => `UPPER(groupname) LIKE '${sq(p).toUpperCase()}'`)
+        .join(' OR ');
+
+      const ctPatterns = (CFG.COST_TEMPLATE_PATTERNS || [])
+        .map(p => `UPPER(name) LIKE '${sq(p).toUpperCase()}'`)
+        .join(' OR ');
+
+      const variants = [];
+
+      if (ctPatterns) {
+        variants.push({
+          tag: 'byUsage',
+          sql: `SELECT eg.id AS id, eg.groupname AS wcname
+                FROM entitygroup eg
+                WHERE eg.isinactive = 'F'
+                  AND eg.id IN (SELECT s.manufacturingworkcenter
+                                FROM ManufacturingRoutingRoutingStep s
+                                JOIN ManufacturingCostTemplate ct
+                                  ON ct.id = s.manufacturingcosttemplate
+                                WHERE s.manufacturingworkcenter IS NOT NULL
+                                  AND (${ctPatterns.replace(/UPPER\(name\)/g, 'UPPER(ct.name)')}))
+                ORDER BY eg.groupname`,
+          map: r => ({ id: r.id, name: r.wcname })
+        });
+      }
+
+      if (patterns) {
+        variants.push({
+          tag: 'byName',
+          sql: `SELECT id, groupname AS wcname
+                FROM entitygroup
+                WHERE isinactive = 'F' AND (${patterns})
+                ORDER BY groupname`,
+          map: r => ({ id: r.id, name: r.wcname })
+        });
+      }
+
+      variants.push(
+        {
+          tag: 'byTypeWC',
+          sql: `SELECT id, groupname AS wcname
+                FROM entitygroup
+                WHERE UPPER(grouptype) LIKE '%WORKCENTER%' AND isinactive = 'F'
+                  AND UPPER(groupname) LIKE 'DOOR%'
+                ORDER BY groupname`,
+          map: r => ({ id: r.id, name: r.wcname })
+        },
+        {
+          tag: 'byTypeEmp',
+          sql: `SELECT id, groupname AS wcname
+                FROM entitygroup
+                WHERE UPPER(grouptype) LIKE '%EMPLOYEE%' AND isinactive = 'F'
+                  AND UPPER(groupname) LIKE 'DOOR%'
+                ORDER BY groupname`,
+          map: r => ({ id: r.id, name: r.wcname })
+        }
+      );
+
+      const rows = mergeQueries(variants, 'listWorkCenters');
+
+      const skip = {};
+      for (const n of (CFG.WORK_CENTER_EXCLUDE || [])) skip[normName(n)] = true;
+      return rows.filter(r => !skip[normName(r.name)]);
+    });
+  }
+
+  // Door cost templates only. The account's other ~130 templates are hitch and
+  // aluminum work and would be nothing but noise in a door routing dropdown.
+  function listCostTemplates() {
+    return cached('costtemplates', CFG.CACHE_TTL_LISTS, () => {
+      const patterns = (CFG.COST_TEMPLATE_PATTERNS || [])
+        .map(p => `UPPER(name) LIKE '${sq(p).toUpperCase()}'`)
+        .join(' OR ');
+
+      const variants = [];
+      if (patterns) {
+        variants.push({
+          tag: 'byName',
+          sql: `SELECT id, name AS ctname
+                FROM ManufacturingCostTemplate
+                WHERE isinactive = 'F' AND (${patterns})
+                ORDER BY name`,
+          map: r => ({ id: r.id, name: r.ctname })
+        });
+      }
+      // If the name patterns ever stop matching, an empty dropdown is worse
+      // than a long one. Fall back to everything rather than nothing.
+      variants.push({
+        tag: 'all',
+        sql: `SELECT id, name AS ctname
+              FROM ManufacturingCostTemplate
+              WHERE isinactive = 'F' ORDER BY name`,
+        map: r => ({ id: r.id, name: r.ctname })
+      });
+
+      for (const v of variants) {
+        try {
+          const rows = query.runSuiteQL({ query: v.sql }).asMappedResults();
+          if (rows && rows.length) return rows.map(v.map);
+        } catch (e) {
+          log.audit({ title: 'listCostTemplates variant ' + v.tag + ' failed', details: e.toString() });
+        }
+      }
+      log.error({ title: 'listCostTemplates — every variant empty', details: 'dropdown will be empty' });
+      return [];
+    });
+  }
+
+  // Item classes. Full path (fullname) shown so nested duplicates stay apart.
+  function listClasses() {
+    return cached('classes', CFG.CACHE_TTL_LISTS, () => tryQueries([
+      {
+        sql: `SELECT id, fullname AS cname FROM classification
+              WHERE isinactive = 'F' ORDER BY fullname`,
+        map: r => ({ id: r.id, name: r.cname })
+      }
+    ], 'listClasses'));
+  }
+
+  // Resolves a work center / cost template / class NAME to an internal ID.
+  // Exact first, then starts-with, then contains — all whitespace-normalised.
+  function matchNameToId(list, wanted) {
+    if (!wanted) return '';
+    const w = normName(wanted);
+    let hit = list.filter(r => normName(r.name) === w)[0];
+    if (!hit) hit = list.filter(r => normName(r.name).indexOf(w) === 0)[0];
+    if (!hit) hit = list.filter(r => normName(r.name).indexOf(w) !== -1)[0];
+    // Classes are stored as full paths ("PARENT : 4000 SERIES"), so a
+    // trailing-segment match is the one that usually lands.
+    if (!hit) hit = list.filter(r => normName(r.name).split(':').pop().trim() === w)[0];
+    return hit ? String(hit.id) : '';
+  }
+
+  // ─── EDIT MODE — LOAD ─────────────────────────────────────────────────────
+  // Pulls the whole family: for each of DR/F/C/S that exists, its item fields,
+  // BOM, current revision, components, and default routing steps.
+  function loadDoorForEdit(term) {
+    const parsed = parseDoorTerm(term);
+    if (!parsed) return { ok: false, message: 'Enter a door number.' };
+
+    let series = parsed.series;
+    const number = parsed.number;
+
+    // A bare number needs its series resolved before anything else can be
+    // named. The DR item is the authority on which series a number belongs to.
+    if (!series) {
+      try {
+        const rows = query.runSuiteQL({
+          query: `SELECT itemid FROM item
+                  WHERE REGEXP_LIKE(itemid, '^DR-[0-9]+-${sq(number)}$')`
+        }).asMappedResults();
+        if (!rows.length) return { ok: false, message: 'No door found on number ' + number + '.' };
+        const m = String(rows[0].itemid).match(/^DR-([0-9]+)-/);
+        series = m ? m[1] : '';
+      } catch (e) {
+        return { ok: false, message: 'Could not resolve the series for ' + number + ': ' + e.message };
+      }
+    }
+    if (!series) return { ok: false, message: 'Could not work out the series for ' + number + '.' };
+
+    const nums = familyNumbers(series, number);
+    const found = checkPartNumbers(ALL_FAMILIES.map(f => nums[f]));
+    if (!found[nums.DR.toUpperCase()]) {
+      return { ok: false, message: nums.DR + ' was not found.' };
+    }
+
+    const out = {
+      ok: true,
+      series: series,
+      number: number,
+      doorNumber: nums.DR,
+      numbers: nums,
+      families: {},
+      warnings: []
+    };
+
+    for (const f of ALL_FAMILIES) {
+      const itemId = found[nums[f].toUpperCase()];
+      if (!itemId) continue;
+      const loaded = loadFamilyUnit(f, nums[f], itemId, out.warnings);
+      if (loaded) out.families[f] = loaded;
+    }
+
+    const dr = out.families.DR;
+    if (!dr) return { ok: false, message: 'Could not read ' + nums.DR + '.' };
+
+    // The description is typed once and cascades, so the door's own text is
+    // the one to show. The sub-assembly prefixes are re-derived on save.
+    out.description = dr.description || '';
+    out.classId = dr.classId || '';
+    out.cutDetails = dr.cutDetails || '';
+    out.doorLine = dr.doorLine || '';
+    out.hasScreen = !!out.families.S;
+
+    // Split the door's own BOM into the sub-assembly lines (which this tool
+    // owns and re-derives) and everything else (loose hardware the person
+    // edits by hand). Without this split, editing a door would show its own
+    // frame and core as ordinary component rows and invite someone to delete
+    // the very lines that make it a door.
+    if (dr.components) {
+      const subNums = {};
+      for (const f of ['F', 'C', 'S']) subNums[nums[f].toUpperCase()] = f;
+      const sub = [], loose = [];
+      for (const c of dr.components) {
+        const fam = subNums[String(c.itemNumber || '').toUpperCase()];
+        if (fam) sub.push(Object.assign({ family: fam }, c));
+        else loose.push(c);
+      }
+      dr.subLines = sub;
+      dr.components = loose;
+    }
+
+    return out;
+  }
+
+  // One family's worth of live setup: item fields, BOM, current revision,
+  // components, default routing and its steps.
+  function loadFamilyUnit(fam, partNum, itemId, warnings) {
+    let item;
+    try {
+      item = record.load({ type: record.Type.ASSEMBLY_ITEM, id: itemId, isDynamic: false });
+    } catch (e) {
+      warnings.push('Could not load ' + partNum + ': ' + e.message);
+      return null;
+    }
+
+    const unit = {
+      family: fam,
+      partNumber: partNum,
+      itemId: itemId,
+      description: item.getValue({ fieldId: 'description' }) || '',
+      classId: safeGet(item, 'class'),
+      cutDetails: safeGet(item, CFG.CUT_DETAILS_FIELD),
+      doorLine: safeGet(item, CFG.DOOR_LINE_FIELD),
+      components: [],
+      steps: [],
+      bomId: '', bomName: '', revId: '', revName: '', revEffectiveStart: null,
+      routingId: '', routingName: ''
+    };
+
+    // The BOM link lives on the item's own sublist, not in SuiteQL. Prefer the
+    // master-default line; fall back to line 0 if nothing is flagged.
+    let bomId = '';
+    try {
+      const lineCount = item.getLineCount({ sublistId: 'billofmaterials' });
+      for (let i = 0; i < lineCount; i++) {
+        const isDefault = item.getSublistValue({ sublistId: 'billofmaterials', fieldId: 'masterdefault', line: i });
+        const bId = item.getSublistValue({ sublistId: 'billofmaterials', fieldId: 'billofmaterials', line: i });
+        if (isDefault) { bomId = bId; break; }
+        if (!bomId) bomId = bId;
+      }
+    } catch (e) {
+      log.audit({ title: 'loadFamilyUnit — bom sublist read failed', details: partNum + ': ' + e.toString() });
+    }
+
+    if (!bomId) {
+      warnings.push(partNum + ' has no BOM attached — its lines cannot be edited here.');
+      return unit;
+    }
+    unit.bomId = bomId;
+
+    try {
+      const rows = query.runSuiteQL({
+        query: `SELECT id, name, usecomponentyield FROM bom WHERE id = ${parseInt(bomId, 10)}`
+      }).asMappedResults();
+      if (rows[0]) {
+        unit.bomName = rows[0].name;
+        unit.useComponentYield = rows[0].usecomponentyield === 'T' || rows[0].usecomponentyield === true;
+      }
+    } catch (e) {
+      warnings.push('Could not read BOM ' + bomId + ' for ' + partNum + '.');
+    }
+
+    // bom.bomrevision is a comma-joined list of EVERY revision on the BOM, not
+    // the current one. The current revision is the one still open (no
+    // effective end date); if several are open, or none are, take the latest
+    // start date.
+    let revisions = [];
+    try {
+      revisions = query.runSuiteQL({
+        query: `SELECT id, name, effectivestartdate, effectiveenddate
+                FROM bomrevision
+                WHERE billofmaterials = ${parseInt(bomId, 10)} AND isinactive = 'F'`
+      }).asMappedResults();
+    } catch (e) {
+      warnings.push('Could not read revisions for ' + partNum + '.');
+      return unit;
+    }
+    if (!revisions.length) {
+      warnings.push(partNum + '\u2019s BOM has no active revisions.');
+      return unit;
+    }
+
+    const openRevs = revisions.filter(r => !r.effectiveenddate);
+    const pool = openRevs.length ? openRevs.slice() : revisions.slice();
+    pool.sort((a, b) => dateSortKey(b.effectivestartdate) - dateSortKey(a.effectivestartdate));
+    const revRow = pool[0];
+    unit.revId = revRow.id;
+    unit.revName = revRow.name;
+    unit.revEffectiveStart = revRow.effectivestartdate;
+
+    if (openRevs.length > 1) {
+      log.audit({
+        title: 'multiple open BOM revisions on ' + partNum,
+        details: openRevs.map(r => r.name + ' (' + r.id + ')').join(', ') + ' — using ' + revRow.name
+      });
+    }
+
+    try {
+      unit.components = query.runSuiteQL({
+        query: `SELECT brc.lineid AS lineid, brc.item AS itemid, i.itemid AS itemnumber,
+                       brc.displayname AS itemdesc, i.itemtype AS itemtype,
+                       brc.bomquantity AS qty, brc.itemsource AS source
+                FROM bomrevisioncomponent brc
+                JOIN item i ON i.id = brc.item
+                WHERE brc.bomrevision = ${parseInt(unit.revId, 10)}
+                ORDER BY brc.lineid`
+      }).asMappedResults().map(r => ({
+        itemId: r.itemid,
+        itemNumber: r.itemnumber,
+        desc: r.itemdesc || '',
+        itemType: r.itemtype || '',
+        quantity: r.qty,
+        itemSource: r.source || 'STOCK'
+      }));
+    } catch (e) {
+      warnings.push('Could not read components for ' + partNum + '.');
+    }
+
+    if (CFG.BUILDS_ROUTING[fam]) {
+      try {
+        const rr = query.runSuiteQL({
+          query: `SELECT id, name FROM ManufacturingRouting
+                  WHERE billofmaterials = ${parseInt(bomId, 10)}
+                    AND isdefault = 'T' AND isinactive = 'F'`
+        }).asMappedResults();
+        if (rr[0]) {
+          unit.routingId = rr[0].id;
+          unit.routingName = rr[0].name;
+          unit.steps = query.runSuiteQL({
+            query: `SELECT operationsequence, operationname, manufacturingworkcenter,
+                           manufacturingcosttemplate, runrate, setuptime
+                    FROM ManufacturingRoutingRoutingStep
+                    WHERE manufacturingrouting = ${parseInt(unit.routingId, 10)}
+                    ORDER BY operationsequence`
+          }).asMappedResults().map(r => ({
+            sequence: r.operationsequence,
+            operationName: r.operationname,
+            workCenterId: r.manufacturingworkcenter || '',
+            costTemplateId: r.manufacturingcosttemplate || '',
+            runRate: r.runrate || 0,
+            setupTime: r.setuptime || 0
+          }));
+        }
+      } catch (e) {
+        log.audit({ title: 'loadFamilyUnit — routing read failed', details: partNum + ': ' + e.toString() });
+      }
+    }
+
+    return unit;
+  }
+
+  function safeGet(item, fieldId) {
+    if (!fieldId) return '';
+    try {
+      const v = item.getValue({ fieldId: fieldId });
+      return (v === null || v === undefined) ? '' : v;
+    } catch (e) { return ''; }
+  }
+
+  // Sorts NetSuite's MM/DD/YYYY strings without depending on locale parsing.
+  // Unparseable values sort oldest so they never win "current revision" by
+  // accident.
+  function dateSortKey(s) {
+    if (!s) return 0;
+    const m = String(s).trim().match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+    if (m) return (+m[3]) * 10000 + (+m[1]) * 100 + (+m[2]);
+    const d = new Date(s);
+    return isNaN(d.getTime()) ? 0 : d.getTime();
+  }
+
+  // ─── THE BUILD ────────────────────────────────────────────────────────────
+  // One family unit: BOM -> item (BOM attached inline) -> revision -> routing
+  // -> optional BOM scoping. Everything created is pushed onto `created` so
+  // the caller can unwind the WHOLE door, not just this family.
+  function buildUnit(o) {
+    const created = o.created;
+    const res = { family: o.family, name: o.partNum };
+
+    // BOM first, so it can be attached during the item's own save.
+    const bomName = o.partNum + ' BOM';
+    const bomId = createBom(bomName, o.subsidiaryId);
+    created.push({ type: record.Type.BOM, id: bomId });
+    res.bom = { id: bomId, name: bomName, restricted: false };
+    if (o.timer) o.timer.mark(o.family + '.bom');
+
+    const itemOut = {};
+    const itemId = createAssemblyItem({
+      family: o.family,
+      partNum: o.partNum,
+      description: o.description,
+      defaults: o.defaults,
+      subsidiaryId: o.subsidiaryId,
+      classId: o.classId,
+      cutDetails: o.cutDetails,
+      doorLine: o.doorLine,
+      bomId: bomId,
+      out: itemOut
+    });
+    created.push({ type: record.Type.ASSEMBLY_ITEM, id: itemId });
+    res.item = itemOut.item;
+    res.item.id = itemId;
+    if (o.timer) o.timer.mark(o.family + '.item');
+
+    // BOM revision + components
+    const revName = o.partNum + CFG.REV_NAME_SEP[o.family] + (o.revLetter || 'A').toUpperCase();
+    const rev = record.create({ type: record.Type.BOM_REVISION, isDynamic: false });
+    rev.setValue({ fieldId: 'billofmaterials', value: bomId });
+    rev.setValue({ fieldId: 'name', value: revName });
+    rev.setValue({ fieldId: 'effectivestartdate', value: o.effectiveDate });
+    if (o.revMemo) rev.setValue({ fieldId: 'memo', value: o.revMemo });
+
+    writeRevisionComponents(rev, o.components, o.autoIssue);
+
+    const revId = rev.save({ enableSourcing: CFG.ENABLE_SOURCING });
+    created.push({ type: record.Type.BOM_REVISION, id: revId });
+    res.revision = { id: revId, name: revName, lines: o.components.length };
+    if (o.timer) o.timer.mark(o.family + '.revision');
+
+    // Routing — doors themselves never get one.
+    if (CFG.BUILDS_ROUTING[o.family] && o.steps && o.steps.length) {
+      const routingName = o.partNum + ' ROUTING';
+      const routing = record.create({ type: record.Type.MANUFACTURING_ROUTING, isDynamic: false });
+      routing.setValue({ fieldId: 'name', value: routingName });
+      routing.setValue({ fieldId: 'billofmaterials', value: bomId });
+      routing.setValue({ fieldId: 'isdefault', value: true });
+      if (o.subsidiaryId) routing.setValue({ fieldId: 'subsidiary', value: o.subsidiaryId });
+      if (o.locationId)   routing.setValue({ fieldId: 'location', value: o.locationId });
+
+      writeRoutingSteps(routing, o.steps);
+
+      const routingId = routing.save({ enableSourcing: CFG.ENABLE_SOURCING });
+      created.push({ type: record.Type.MANUFACTURING_ROUTING, id: routingId });
+      res.routing = { id: routingId, name: routingName, steps: o.steps.length };
+      if (o.timer) o.timer.mark(o.family + '.routing');
+    }
+
+    if (CFG.RESTRICT_BOM_TO_ASSEMBLY) {
+      res.bom.restricted = restrictBomToAssembly(bomId, itemId);
+      if (o.timer) o.timer.mark(o.family + '.bomScope');
+    }
+
+    return res;
+  }
+
+  function buildDoor(p) {
+    const created = [];   // { type, id } — unwound newest-first on failure
+    const out = { families: {} };
+    const t0 = Date.now();
+    const timer = makeTimer();
+
+    try {
+      // ── Validate ───────────────────────────────────────────────────────
+      const series = String(p.series || '').trim();
+      if (!series) throw new Error('Pick a door series.');
+      const number = String(p.number || '').trim();
+      if (!number) throw new Error('Door number is required.');
+      if (!/^[0-9]+$/.test(number)) throw new Error('Door number must be digits only.');
+
+      let description = String(p.description || '').trim();
+      if (!description) throw new Error('Description is required.');
+      // The description opens with the series on 3,126 of 3,182 live doors.
+      // Prepend it if the person didn't, rather than nagging about it.
+      if (CFG.SERIES_IN_DESC && description.indexOf(series) !== 0) {
+        description = series + ' ' + description;
+      }
+
+      const wantScreen = !!p.includeScreen;
+      const families = ['F', 'C'].concat(wantScreen ? ['S'] : []);
+
+      const nums = familyNumbers(series, number);
+      const wanted = families.concat(['DR']).map(f => nums[f]);
+      const existing = checkPartNumbers(wanted);
+      const clashes = wanted.filter(n => existing[n.toUpperCase()]);
+      if (clashes.length) {
+        throw new Error(
+          clashes.join(', ') + (clashes.length > 1 ? ' already exist.' : ' already exists.') +
+          ' Pick a different door number — the next free one is ' + (nextDoorNumber() || 'unknown') + '.'
+        );
+      }
+
+      // ── Per-family payloads off the form ───────────────────────────────
+      const inbound = p.families || {};
+      for (const f of families) {
+        const fam = inbound[f] || {};
+        const comps = (fam.components || []).filter(c => c.itemId);
+        if (!comps.length) {
+          throw new Error(FAMILY_LABEL[f] + ' needs at least one component.');
+        }
+        const steps = (fam.steps || []).filter(s => s.operationName);
+        if (!steps.length) {
+          throw new Error(FAMILY_LABEL[f] + ' needs at least one routing step.');
+        }
+        validateSequences(steps, FAMILY_LABEL[f]);
+      }
+
+      timer.mark('validate');
+
+      // ── Shared context ─────────────────────────────────────────────────
+      const defaults = {};
+      for (const f of families.concat(['DR'])) defaults[f] = getTemplateDefaults(f);
+      timer.mark('template');
+
+      let subsidiaryId = CFG.SUBSIDIARY_ID;
+      for (const f of families.concat(['DR'])) {
+        if (defaults[f] && defaults[f].subsidiary) { subsidiaryId = defaults[f].subsidiary; break; }
+      }
+      if (!subsidiaryId) {
+        throw new Error('No subsidiary resolved. Check the template items or set CFG.SUBSIDIARY_ID.');
+      }
+
+      const locationId = p.locationId || CFG.LOCATION_ID;
+
+      // Class: whatever the form sent, else the series default resolved by
+      // name against this account's own class list.
+      let classId = p.classId ? String(p.classId).trim() : '';
+      if (!classId) {
+        const seriesRow = SERIES.filter(s => s.code === series)[0];
+        if (seriesRow) classId = matchNameToId(listClasses(), seriesRow.cls);
+        if (!classId && seriesRow) {
+          log.audit({
+            title: 'series class not resolved',
+            details: 'series ' + series + ' wanted class "' + seriesRow.cls +
+                     '" — falling back to the template value'
+          });
+        }
+      }
+
+      const effectiveDate = p.effectiveDate
+        ? format.parse({ value: p.effectiveDate, type: format.Type.DATE })
+        : offsetDate(CFG.EFFECTIVE_DATE_OFFSET_DAYS);
+
+      const cutDetails = String(p.cutDetails == null ? '' : p.cutDetails);
+      const doorLine = p.doorLine ? String(p.doorLine).trim() : '';
+
+      // ── 1. Sub-assemblies first — the door's BOM needs their IDs ───────
+      const built = {};
+      for (const f of families) {
+        const fam = inbound[f] || {};
+        built[f] = buildUnit({
+          timer, family: f, created,
+          partNum: nums[f],
+          description: CFG.DESC_PREFIX[f] + description,
+          defaults: defaults[f],
+          subsidiaryId, locationId, classId,
+          cutDetails: '',     // the cut list lives on the door only
+          doorLine: doorLine,
+          components: (fam.components || []).filter(c => c.itemId),
+          steps: (fam.steps || []).filter(s => s.operationName),
+          effectiveDate,
+          revLetter: p.revLetter,
+          revMemo: p.revMemo,
+          autoIssue: p.autoIssue
+        });
+        out.families[f] = built[f];
+      }
+
+      // ── 2. The door, consuming them ────────────────────────────────────
+      const drFam = inbound.DR || {};
+      const subLines = [];
+      for (const f of CFG.DR_COMPONENT_ORDER) {
+        if (!built[f]) continue;
+        subLines.push({
+          itemId: built[f].item.id,
+          quantity: 1,
+          itemSource: CFG.DR_SUBASSEMBLY_SOURCE
+        });
+      }
+      const drComponents = subLines.concat(
+        (drFam.components || []).filter(c => c.itemId)
+      );
+      if (!drComponents.length) {
+        throw new Error('The door has no components — nothing to build it from.');
+      }
+
+      out.families.DR = buildUnit({
+        timer, family: 'DR', created,
+        partNum: nums.DR,
+        description: description,
+        defaults: defaults.DR,
+        subsidiaryId, locationId, classId,
+        cutDetails: cutDetails,
+        doorLine: doorLine,
+        components: drComponents,
+        steps: [],           // doors have no routing, by design
+        effectiveDate,
+        revLetter: p.revLetter,
+        revMemo: p.revMemo,
+        autoIssue: p.autoIssue
+      });
+
+      out.ok = true;
+      out.series = series;
+      out.number = number;
+      out.doorNumber = nums.DR;
+      out.description = description;
+      out.ms = Date.now() - t0;
+
+      if (CFG.LOG_TIMINGS) {
+        log.audit({
+          title: 'door build timing ' + nums.DR + ' (' + out.ms + 'ms total)',
+          details: timer.report() +
+                   '  | sourcing=' + (CFG.ENABLE_SOURCING ? 'on' : 'off') +
+                   ' bomScope=' + (CFG.RESTRICT_BOM_TO_ASSEMBLY ? 'on' : 'off') +
+                   ' families=' + families.concat(['DR']).join('/')
+        });
+        out.timing = timer.report();
+      }
+
+      const names = families.concat(['DR']).map(f => nums[f]);
+      out.message = nums.DR + ' created with ' + (names.length - 1) + ' sub-assembl' +
+                    (names.length - 1 === 1 ? 'y' : 'ies') + '.';
+      return out;
+
+    } catch (e) {
+      log.error({ title: 'buildDoor failed — rolling back', details: e.toString() + ' | ' + (e.stack || '') });
+      const undone = rollback(created);
+      return { ok: false, message: e.message || String(e), rolledBack: undone };
+    }
+  }
+
+  // One step per sequence, per routing. NetSuite refuses a duplicate and the
+  // message it gives back is far less useful than this one.
+  function validateSequences(steps, label) {
+    const seen = {};
+    for (const s of steps) {
+      const seq = String(s.sequence || '').trim();
+      if (!seq) throw new Error(label + ': every routing step needs an operation sequence.');
+      if (seen[seq]) {
+        throw new Error(
+          label + ': ' + seen[seq] + ' and ' + s.operationName + ' are both on sequence ' + seq +
+          '. NetSuite needs one step per sequence — change one of them.'
+        );
+      }
+      seen[seq] = s.operationName;
+    }
+  }
+
+  // Writes component lines onto a BOM_REVISION record (new or freshly loaded).
+  // Shared by the build, Update Fields, and New BOM Rev, so the auto-issue
+  // resolution and line-writing exist once instead of three times.
+  function writeRevisionComponents(rev, components, autoIssue, ops) {
+    const wantAutoIssue = autoIssue !== false;
+    // ops = { field, map } captured before the lines were cleared, so each
+    // component goes back onto the routing step it was already tied to.
+    const opsField = (ops && ops.field) ? ops.field : null;
+    const opsMap = (ops && ops.map) ? ops.map : null;
+    let autoIssueField = null;
+    let autoIssueFields = [];
+    let autoIssueTried = false;
+
+    components.forEach((c, i) => {
+      rev.setSublistValue({ sublistId: 'component', fieldId: 'item', line: i, value: c.itemId });
+      rev.setSublistValue({
+        sublistId: 'component', fieldId: 'bomquantity', line: i,
+        value: parseFloat(c.quantity) || 1
+      });
+      rev.setSublistValue({
+        sublistId: 'component', fieldId: 'itemsource', line: i,
+        value: c.itemSource || 'STOCK'
+      });
+
+      if (opsField && opsMap) {
+        const seq = opsMap[String(c.itemId)];
+        if (seq !== undefined && seq !== null && seq !== '') {
+          try {
+            rev.setSublistValue({ sublistId: 'component', fieldId: opsField, line: i, value: seq });
+          } catch (e) {
+            log.audit({ title: 'operation sequence set failed on line ' + i, details: e.toString() });
+          }
+        }
+      }
+
+      if (wantAutoIssue) {
+        if (!autoIssueTried) {
+          const r = resolveAutoIssueField(rev, i);
+          autoIssueField = r.field;
+          autoIssueFields = r.available || [];
+          autoIssueTried = true;
+        } else if (autoIssueField) {
+          try {
+            rev.setSublistValue({
+              sublistId: 'component', fieldId: autoIssueField, line: i, value: true
+            });
+          } catch (e) {
+            log.audit({ title: 'auto-issue set failed on line ' + i, details: e.toString() });
+          }
+        }
+      }
+    });
+
+    return {
+      autoIssue: wantAutoIssue ? (autoIssueField ? autoIssueField : 'unavailable') : false,
+      componentFields: (wantAutoIssue && !autoIssueField) ? autoIssueFields : null
+    };
+  }
+
+  function writeRoutingSteps(routing, steps) {
+    steps.forEach((s, i) => {
+      routing.setSublistValue({
+        sublistId: 'routingstep', fieldId: 'operationsequence', line: i,
+        value: parseInt(s.sequence, 10)
+      });
+      routing.setSublistValue({
+        sublistId: 'routingstep', fieldId: 'operationname', line: i,
+        value: s.operationName
+      });
+      if (s.workCenterId) {
+        routing.setSublistValue({
+          sublistId: 'routingstep', fieldId: 'manufacturingworkcenter', line: i,
+          value: s.workCenterId
+        });
+      }
+      if (s.costTemplateId) {
+        routing.setSublistValue({
+          sublistId: 'routingstep', fieldId: 'manufacturingcosttemplate', line: i,
+          value: s.costTemplateId
+        });
+      }
+      routing.setSublistValue({
+        sublistId: 'routingstep', fieldId: 'runrate', line: i,
+        value: parseFloat(s.runRate) || 0
+      });
+      routing.setSublistValue({
+        sublistId: 'routingstep', fieldId: 'setuptime', line: i,
+        value: parseFloat(s.setupTime) || 0
+      });
+    });
+  }
+
+  // Creates the assembly item. Template fields go on FIRST, then everything
+  // typed on the form, so a template value can never overwrite user input.
+  // The BOM is attached inline during this same save — no reload, no re-save.
+  function createAssemblyItem(o) {
+    const item = record.create({ type: record.Type.ASSEMBLY_ITEM, isDynamic: false });
+    applyDefaults(item, o.defaults);
+
+    item.setValue({ fieldId: 'itemid', value: o.partNum });
+    const descFields = setDescriptions(item, o.description);
+    if (!descFields.length) {
+      throw new Error(
+        'Could not write the description to any of: ' + CFG.DESCRIPTION_FIELDS.join(', ') +
+        '. Check CFG.DESCRIPTION_FIELDS against your item form.'
+      );
+    }
+    if (o.subsidiaryId) item.setValue({ fieldId: 'subsidiary', value: [o.subsidiaryId] });
+
+    // Location is what actually marks this as a door part — every one of the
+    // 5,588 live door items carries both fields set to GEN-Y DOOR.
+    if (CFG.LOCATION_ID) {
+      try { item.setValue({ fieldId: 'location', value: CFG.LOCATION_ID }); }
+      catch (e) { log.audit({ title: 'location set failed', details: e.toString() }); }
+      if (CFG.SET_PREFERRED_LOCATION) {
+        try { item.setValue({ fieldId: 'preferredlocation', value: CFG.LOCATION_ID }); }
+        catch (e) { log.audit({ title: 'preferredlocation set failed', details: e.toString() }); }
+      }
+    }
+
+    if (o.bomId) {
+      item.setSublistValue({
+        sublistId: 'billofmaterials', fieldId: 'billofmaterials', line: 0, value: o.bomId
+      });
+      item.setSublistValue({
+        sublistId: 'billofmaterials', fieldId: 'masterdefault', line: 0, value: true
+      });
+    }
+
+    // Everything the person chose goes on LAST, so nothing from the template
+    // can override it — same reasoning as the description.
+    const applied = [];
+    if (o.classId) {
+      try { item.setValue({ fieldId: 'class', value: o.classId }); applied.push('class'); }
+      catch (e) { log.audit({ title: 'class set failed', details: e.toString() }); }
+    }
+    if (o.cutDetails && CFG.CUT_DETAILS_FIELD) {
+      try { item.setValue({ fieldId: CFG.CUT_DETAILS_FIELD, value: o.cutDetails }); applied.push('cut details'); }
+      catch (e) { log.audit({ title: 'cut details set failed', details: e.toString() }); }
+    }
+    if (o.doorLine && CFG.DOOR_LINE_FIELD) {
+      try { item.setValue({ fieldId: CFG.DOOR_LINE_FIELD, value: o.doorLine }); applied.push('door line'); }
+      catch (e) { log.audit({ title: 'door line set failed', details: e.toString() }); }
+    }
+
+    o.out.item = { name: o.partNum, family: o.family, descriptionFields: descFields, fields: applied };
+    return item.save({ ignoreMandatoryFields: false, enableSourcing: CFG.ENABLE_SOURCING });
+  }
+
+  // Created available to all assemblies so it's immediately valid to attach to
+  // the new item; scoping happens after, via restrictBomToAssembly().
+  // Component yield is off on all 3,556 live door BOMs, so it isn't offered.
+  function createBom(name, subsidiaryId) {
+    const b = record.create({ type: record.Type.BOM, isDynamic: false });
+    b.setValue({ fieldId: 'name', value: name });
+    b.setValue({ fieldId: 'usecomponentyield', value: false });
+    b.setValue({ fieldId: 'availableforalllocations', value: true });
+    b.setValue({ fieldId: 'availableforallassemblies', value: true });
+    if (subsidiaryId) b.setValue({ fieldId: 'subsidiary', value: [subsidiaryId] });
+    return b.save({ enableSourcing: CFG.ENABLE_SOURCING });
+  }
+
+  // Narrows the BOM to the one assembly it belongs to — the convention on
+  // every door BOM in the account. Best-effort: the restriction sublist ID
+  // varies, and everything is already built and linked by this point, so a
+  // failure just leaves the BOM open rather than failing the build.
+  function restrictBomToAssembly(bomId, assemblyItemId) {
+    for (const sublistId of CFG.BOM_RESTRICT_SUBLISTS) {
+      try {
+        const b = record.load({ type: record.Type.BOM, id: bomId, isDynamic: false });
+        b.setValue({ fieldId: 'availableforallassemblies', value: false });
+        b.setSublistValue({
+          sublistId: sublistId, fieldId: 'assembly', line: 0, value: assemblyItemId
+        });
+        b.save();
+        return true;
+      } catch (e) {
+        log.audit({
+          title: 'BOM restriction attempt failed (' + sublistId + ')',
+          details: e.toString()
+        });
+      }
+    }
+    log.audit({ title: 'BOM left available to all assemblies', details: 'no restriction sublist matched' });
+    return false;
+  }
+
+  function resolveAutoIssueField(rev, line) {
+    let available = [];
+    try {
+      available = rev.getSublistFields({ sublistId: 'component' }) || [];
+    } catch (e) {
+      log.audit({ title: 'getSublistFields failed', details: e.toString() });
+    }
+
+    const discovered = available.filter(f => /auto.?issue/i.test(f));
+    const candidates = [];
+    for (const f of CFG.AUTO_ISSUE_FIELDS) if (candidates.indexOf(f) === -1) candidates.push(f);
+    for (const f of discovered) if (candidates.indexOf(f) === -1) candidates.push(f);
+
+    for (const f of candidates) {
+      if (available.length && available.indexOf(f) === -1) continue;
+      try {
+        rev.setSublistValue({ sublistId: 'component', fieldId: f, line: line, value: true });
+        const back = rev.getSublistValue({ sublistId: 'component', fieldId: f, line: line });
+        if (back === true || back === 'T' || back === 'true') {
+          return { field: f, available: available };
+        }
+      } catch (e) { /* not this one */ }
+    }
+
+    log.audit({
+      title: 'auto-issue not available',
+      details: 'tried ' + candidates.join(', ') + ' — components saved without it'
+    });
+    return { field: null, available: available };
+  }
+
+  function resolveOpSeqField(rev) {
+    let available = [];
+    try { available = rev.getSublistFields({ sublistId: 'component' }) || []; }
+    catch (e) { log.audit({ title: 'getSublistFields failed (opseq)', details: e.toString() }); }
+
+    const discovered = available.filter(f => /operation.*sequence|opseq/i.test(f));
+    if (discovered.length) return discovered[0];
+
+    for (const f of CFG.COMPONENT_OPSEQ_FIELDS) {
+      if (available.length && available.indexOf(f) === -1) continue;
+      try {
+        const v = rev.getSublistValue({ sublistId: 'component', fieldId: f, line: 0 });
+        if (v !== undefined) return f;
+      } catch (e) { /* not this one */ }
+    }
+    return null;
+  }
+
+  // Reads the operation sequence off every component line, keyed by item, so
+  // the links survive the clear-and-rewrite that Update Fields does. Without
+  // this, rewriting components silently unlinks them from their routing steps.
+  function captureComponentOps(rev) {
+    const field = resolveOpSeqField(rev);
+    const map = {};
+    if (!field) return { field: null, map: map };
+    let lines = 0;
+    try { lines = rev.getLineCount({ sublistId: 'component' }); }
+    catch (e) { return { field: field, map: map }; }
+    for (let i = 0; i < lines; i++) {
+      try {
+        const itemId = rev.getSublistValue({ sublistId: 'component', fieldId: 'item', line: i });
+        const seq = rev.getSublistValue({ sublistId: 'component', fieldId: field, line: i });
+        const n = parseInt(seq, 10);
+        if (itemId && !isNaN(n)) map[String(itemId)] = n;
+      } catch (e) { /* skip this line */ }
+    }
+    return { field: field, map: map };
+  }
+
+  // Any captured link pointing at a sequence that no longer exists is pulled
+  // to the nearest surviving step, so a rewritten component can never
+  // reintroduce the reference the routing save just rejected.
+  function clampOps(ops, validSeqs) {
+    if (!ops || !ops.field || !validSeqs || !validSeqs.length) return ops;
+    for (const k in ops.map) {
+      const n = parseInt(ops.map[k], 10);
+      if (isNaN(n)) { delete ops.map[k]; continue; }
+      if (validSeqs.indexOf(n) === -1) ops.map[k] = nearestSeq(n, validSeqs);
+    }
+    return ops;
+  }
+
+  // Where a component should point once its own sequence is gone: the nearest
+  // remaining step at or before it, so material still gets issued no later
+  // than it used to. If every remaining step is later, take the first.
+  function nearestSeq(oldSeq, validSeqs) {
+    const below = validSeqs.filter(v => v <= oldSeq);
+    if (below.length) return Math.max.apply(null, below);
+    return Math.min.apply(null, validSeqs);
+  }
+
+  // Before a routing step is deleted, repoint every component on the BOM that
+  // still references its sequence. This is what the NetSuite UI asks you to
+  // confirm when it shows "Invalid Operation Sequence Number" — the script has
+  // to decide it up front instead. Every ACTIVE revision on the BOM is swept,
+  // not just the current one: the routing belongs to the BOM, so a stale
+  // reference on any revision blocks the save.
+  function remapComponentOperations(bomId, validSeqs, removedSeqs) {
+    const changes = [];
+    if (!bomId || !validSeqs.length || !removedSeqs.length) return changes;
+
+    let revIds = [];
+    try {
+      revIds = query.runSuiteQL({
+        query: `SELECT id, name FROM bomrevision
+                WHERE billofmaterials = ${parseInt(bomId, 10)} AND isinactive = 'F'`
+      }).asMappedResults();
+    } catch (e) {
+      log.error({ title: 'remapComponentOperations — revision list failed', details: e.toString() });
+      return changes;
+    }
+
+    for (const row of revIds) {
+      let rev;
+      try {
+        rev = record.load({ type: record.Type.BOM_REVISION, id: row.id, isDynamic: false });
+      } catch (e) { continue; }
+      const field = resolveOpSeqField(rev);
+      if (!field) continue;
+
+      let lines = 0;
+      try { lines = rev.getLineCount({ sublistId: 'component' }); } catch (e) { continue; }
+
+      let touched = false;
+      for (let i = 0; i < lines; i++) {
+        let cur;
+        try { cur = rev.getSublistValue({ sublistId: 'component', fieldId: field, line: i }); }
+        catch (e) { continue; }
+        const n = parseInt(cur, 10);
+        if (isNaN(n) || removedSeqs.indexOf(n) === -1) continue;
+
+        const to = nearestSeq(n, validSeqs);
+        try {
+          rev.setSublistValue({ sublistId: 'component', fieldId: field, line: i, value: to });
+          touched = true;
+          changes.push({ revision: row.name, line: i + 1, from: n, to: to });
+        } catch (e) {
+          log.audit({ title: 'remap set failed on line ' + i, details: e.toString() });
+        }
+      }
+
+      if (touched) {
+        try { rev.save({ enableSourcing: CFG.ENABLE_SOURCING }); }
+        catch (e) {
+          log.error({ title: 'remap save failed on revision ' + row.id, details: e.toString() });
+        }
+      }
+    }
+
+    if (changes.length) {
+      log.audit({
+        title: 'component operation sequences remapped',
+        details: changes.map(c => c.revision + ' line ' + c.line + ': ' + c.from + ' -> ' + c.to).join('; ')
+      });
+    }
+    return changes;
+  }
+
+  // ─── EDIT MODE — SAVE ─────────────────────────────────────────────────────
+  // Item fields and routing steps always save in place. BOM components either
+  // overwrite the current revision (asNewRev = false) or land on a freshly
+  // opened revision that replaces it (asNewRev = true): the new revision
+  // starts yesterday and the one it replaces closes the day before — no
+  // overlap, no gap.
+  //
+  // Families are handled one at a time and each one's outcome is recorded, so
+  // a failure on the core doesn't leave you guessing whether the frame saved.
+  function updateDoor(p, asNewRev) {
+    const t0 = Date.now();
+    const done = [];
+    const results = {};
+    try {
+      const doorNumber = String(p.doorNumber || '').trim().toUpperCase();
+      let description = String(p.description || '').trim();
+      if (!description) throw new Error('Description is required.');
+
+      const inbound = p.families || {};
+      const present = ALL_FAMILIES.filter(f => inbound[f] && inbound[f].itemId);
+      if (!present.length) throw new Error('Nothing loaded. Reload the door and try again.');
+
+      // Validate everything BEFORE writing anything. A sequence clash found
+      // halfway through is a half-saved door.
+      for (const f of present) {
+        const fam = inbound[f];
+        const comps = (fam.components || []).filter(c => c.itemId);
+        const subs = (fam.subLines || []).filter(c => c.itemId);
+        if (!comps.length && !subs.length) {
+          throw new Error(FAMILY_LABEL[f] + ' has no components.');
+        }
+        if (CFG.BUILDS_ROUTING[f]) {
+          const steps = (fam.steps || []).filter(s => s.operationName);
+          validateSequences(steps, FAMILY_LABEL[f]);
+        }
+        if (asNewRev) {
+          const nm = String(fam.newRevName || '').trim();
+          if (!nm) throw new Error(FAMILY_LABEL[f] + ' needs a name for its new revision.');
+          if (normName(nm) === normName(fam.revName)) {
+            throw new Error(FAMILY_LABEL[f] + ': "' + nm + '" is the current revision\u2019s name.');
+          }
+        }
+      }
+
+      for (const f of present) {
+        const fam = inbound[f];
+        const r = updateFamilyUnit(f, fam, {
+          description: CFG.DESC_PREFIX[f] + description,
+          classId: p.classId,
+          cutDetails: (f === 'DR') ? p.cutDetails : null,
+          doorLine: p.doorLine,
+          autoIssue: p.autoIssue,
+          asNewRev: asNewRev,
+          done: done
+        });
+        results[f] = r;
+      }
+
+      return {
+        ok: true,
+        ms: Date.now() - t0,
+        doorNumber: doorNumber,
+        description: description,
+        families: results,
+        message: asNewRev
+          ? doorNumber + ' updated — new revisions opened on ' +
+            present.map(f => FAMILY_LABEL[f].toLowerCase()).join(', ') + '.'
+          : doorNumber + ' updated in place.'
+      };
+
+    } catch (e) {
+      log.error({ title: 'updateDoor failed', details: e.toString() + ' | ' + (e.stack || '') });
+      return { ok: false, message: e.message || String(e), alreadySaved: done, families: results };
+    }
+  }
+
+  function updateFamilyUnit(f, fam, o) {
+    const label = FAMILY_LABEL[f];
+    const out = { family: f, partNumber: fam.partNumber };
+
+    // ── 1. Item fields, in place ───────────────────────────────────────
+    const item = record.load({ type: record.Type.ASSEMBLY_ITEM, id: fam.itemId, isDynamic: false });
+    setDescriptions(item, o.description);
+    if (o.classId) {
+      try { item.setValue({ fieldId: 'class', value: o.classId }); } catch (e) { /* n/a */ }
+    }
+    if (o.cutDetails !== null && o.cutDetails !== undefined && CFG.CUT_DETAILS_FIELD) {
+      try { item.setValue({ fieldId: CFG.CUT_DETAILS_FIELD, value: String(o.cutDetails) }); }
+      catch (e) { /* n/a */ }
+    }
+    if (o.doorLine && CFG.DOOR_LINE_FIELD) {
+      try { item.setValue({ fieldId: CFG.DOOR_LINE_FIELD, value: o.doorLine }); } catch (e) { /* n/a */ }
+    }
+    item.save({ ignoreMandatoryFields: false, enableSourcing: CFG.ENABLE_SOURCING });
+    o.done.push(label + ' item fields');
+    out.itemSaved = true;
+
+    // ── 2. Routing steps, in place ─────────────────────────────────────
+    // Routing is not versioned by BOM revision in this data model (one routing
+    // record per BOM), so both save paths update it the same way.
+    const steps = CFG.BUILDS_ROUTING[f] ? (fam.steps || []).filter(s => s.operationName) : [];
+    const newSeqs = steps.map(st => parseInt(st.sequence, 10)).filter(n => !isNaN(n));
+    if (fam.routingId && steps.length) {
+      const routing = record.load({ type: record.Type.MANUFACTURING_ROUTING, id: fam.routingId, isDynamic: false });
+      const existingLines = routing.getLineCount({ sublistId: 'routingstep' });
+
+      // Only REMOVALS can strand a component reference; adding or editing
+      // steps is harmless.
+      const oldSeqs = [];
+      for (let i = 0; i < existingLines; i++) {
+        const v = parseInt(routing.getSublistValue({
+          sublistId: 'routingstep', fieldId: 'operationsequence', line: i
+        }), 10);
+        if (!isNaN(v)) oldSeqs.push(v);
+      }
+      const removed = oldSeqs.filter(v => newSeqs.indexOf(v) === -1);
+      let remapped = [];
+      if (removed.length) remapped = remapComponentOperations(fam.bomId, newSeqs, removed);
+
+      for (let i = existingLines - 1; i >= 0; i--) {
+        routing.removeLine({ sublistId: 'routingstep', line: i });
+      }
+      writeRoutingSteps(routing, steps);
+      routing.save({ enableSourcing: CFG.ENABLE_SOURCING });
+      out.routing = { id: fam.routingId, steps: steps.length, remapped: remapped.length ? remapped : null };
+      o.done.push(label + ' routing (' + steps.length + ' step(s))');
+    }
+
+    // ── 3. Components — in place, or on a new revision ──────────────────
+    // The door's sub-assembly lines are rebuilt from the loaded family rather
+    // than from the grid, so nobody can accidentally drop the frame or core
+    // out of the door by clearing a row.
+    const components = (fam.subLines || []).filter(c => c.itemId)
+      .concat((fam.components || []).filter(c => c.itemId));
+
+    if (!fam.revId) {
+      out.revision = { skipped: true, reason: 'no revision loaded' };
+      return out;
+    }
+
+    if (!o.asNewRev) {
+      const rev = record.load({ type: record.Type.BOM_REVISION, id: fam.revId, isDynamic: false });
+      // Capture the operation-sequence links BEFORE clearing the lines, or
+      // rewriting the components silently unlinks every one of them.
+      const ops = clampOps(captureComponentOps(rev), newSeqs);
+      const existingLines = rev.getLineCount({ sublistId: 'component' });
+      for (let i = existingLines - 1; i >= 0; i--) {
+        rev.removeLine({ sublistId: 'component', line: i });
+      }
+      writeRevisionComponents(rev, components, o.autoIssue, ops);
+      rev.save({ enableSourcing: CFG.ENABLE_SOURCING });
+      out.revision = { id: fam.revId, name: fam.revName, lines: components.length, replaced: false };
+      o.done.push(label + ' components (' + components.length + ')');
+      return out;
+    }
+
+    // Close the current revision first — if this fails, nothing new exists.
+    const oldRev = record.load({ type: record.Type.BOM_REVISION, id: fam.revId, isDynamic: false });
+    const ops = clampOps(captureComponentOps(oldRev), newSeqs);
+
+    // Default dating: new revision starts yesterday, the one it replaces
+    // closes the day before that. That breaks when the current revision
+    // started yesterday or later (a door revised twice in two days), because
+    // the close date would fall BEFORE its own start and NetSuite rejects it:
+    //   "An Effective End Date cannot be set before an Effective Start Date."
+    // So the new start is pushed forward just far enough that the close date
+    // lands on, at the earliest, the old revision's own start date. Still no
+    // overlap and no gap — the window just shifts.
+    let newStart = midnight(offsetDate(CFG.EFFECTIVE_DATE_OFFSET_DAYS));
+    let oldStart = null;
+    try { oldStart = oldRev.getValue({ fieldId: 'effectivestartdate' }); } catch (e) { /* n/a */ }
+    let shifted = false;
+    if (oldStart instanceof Date) {
+      const earliest = midnight(oldStart);
+      earliest.setDate(earliest.getDate() + 1);
+      if (earliest.getTime() > newStart.getTime()) { newStart = earliest; shifted = true; }
+    }
+    const closeDate = new Date(newStart);
+    closeDate.setDate(closeDate.getDate() - 1);
+
+    oldRev.setValue({ fieldId: 'effectiveenddate', value: closeDate });
+    oldRev.save({ enableSourcing: CFG.ENABLE_SOURCING });
+    out.closedRevision = { id: fam.revId, name: fam.revName, effectiveEnd: closeDate };
+
+    const newRev = record.create({ type: record.Type.BOM_REVISION, isDynamic: false });
+    newRev.setValue({ fieldId: 'billofmaterials', value: fam.bomId });
+    newRev.setValue({ fieldId: 'name', value: String(fam.newRevName).trim() });
+    newRev.setValue({ fieldId: 'effectivestartdate', value: newStart });
+    writeRevisionComponents(newRev, components, o.autoIssue, ops);
+    const newRevId = newRev.save({ enableSourcing: CFG.ENABLE_SOURCING });
+
+    out.revision = {
+      id: newRevId, name: String(fam.newRevName).trim(), lines: components.length,
+      replaced: true, effectiveStart: newStart,
+      note: shifted
+        ? 'Dated forward — ' + fam.revName + ' only started the day before, so yesterday was not available.'
+        : null
+    };
+    o.done.push(label + ' new revision ' + out.revision.name);
+    return out;
+  }
+
+  // "... BOM REV A" -> "B", "... REV Z" -> "ZA", "... REV AA" -> "AB".
+  // Anchored on the letters that follow REV so a name with no letter at all
+  // doesn't match a stray V and suggest "W". Falls back to "B" — the person
+  // can retype it either way, and rev letters here are not always sequential.
+  function nextRevLetter(currentName) {
+    const m = String(currentName || '').trim().match(/\bREV[\s-]+([A-Z]+)\s*$/i);
+    if (!m) return 'B';
+    const cur = m[1].toUpperCase();
+    const last = cur.charCodeAt(cur.length - 1);
+    if (last < 90) return cur.slice(0, -1) + String.fromCharCode(last + 1);
+    return cur + 'A';
+  }
+
+  // Writes the description to every description field that exists on the item.
+  // Returns the list that took it, so the caller can confirm at least one
+  // landed rather than silently saving a part with the template's text.
+  function setDescriptions(item, desc) {
+    const text = String(desc == null ? '' : desc);
+    if (!text.trim()) throw new Error('Description resolved to an empty string.');
+    // A concatenation bug once wrote the literal "undefined" into a live
+    // part's description. Refuse rather than persist it.
+    if (/\b(undefined|null|NaN)\b/.test(text)) {
+      throw new Error('Description contains "' + text.match(/\b(undefined|null|NaN)\b/)[0] +
+                      '" — a value did not resolve. Nothing was created: ' + text);
+    }
+
+    const applied = [], failed = [];
+    for (const f of CFG.DESCRIPTION_FIELDS) {
+      try {
+        item.setValue({ fieldId: f, value: text });
+        const back = item.getValue({ fieldId: f });
+        if (String(back) === text) applied.push(f);
+        else failed.push(f + ' (did not stick)');
+      } catch (e) {
+        failed.push(f + ' (' + (e.message || e) + ')');
+      }
+    }
+    if (failed.length) {
+      log.audit({ title: 'description fields skipped', details: failed.join(', ') });
+    }
+    return applied;
+  }
+
+  // Strips the time component so date maths can't be thrown off by hours: a
+  // Date built from "now" is mid-afternoon, one read off a NetSuite record is
+  // midnight, and comparing the two directly misjudges which day is which.
+  function midnight(d) {
+    const out = new Date(d);
+    out.setHours(0, 0, 0, 0);
+    return out;
+  }
+
+  function offsetDate(days) {
+    const d = new Date();
+    d.setDate(d.getDate() + (parseInt(days, 10) || 0));
+    return d;
+  }
+
+  function makeTimer() {
+    const marks = [];
+    let last = Date.now();
+    return {
+      mark(name) {
+        const now = Date.now();
+        marks.push(name + '=' + (now - last) + 'ms');
+        last = now;
+      },
+      report() { return marks.join('  '); }
+    };
+  }
+
+  function rollback(created) {
+    const undone = [];
+    for (let i = created.length - 1; i >= 0; i--) {
+      try {
+        record.delete({ type: created[i].type, id: created[i].id });
+        undone.push(created[i].type + ' ' + created[i].id);
+      } catch (e) {
+        log.error({
+          title: 'rollback failed',
+          details: created[i].type + ' ' + created[i].id + ': ' + e.toString()
+        });
+        undone.push(created[i].type + ' ' + created[i].id + ' (DELETE FAILED — clean up manually)');
+      }
+    }
+    return undone;
+  }
+
+  // ─── TEMPLATE ITEM DEFAULTS ───────────────────────────────────────────────
+  let _defaultsCache = {};
+  function getTemplateDefaults(family) {
+    const id = CFG.TEMPLATE_ITEMS[family];
+    if (!id) return { _fields: {}, subsidiary: '', name: '' };
+    if (_defaultsCache[id]) return _defaultsCache[id];
+    _defaultsCache[id] = cached('tpl_' + id, CFG.CACHE_TTL_TEMPLATE, () => readTemplateDefaults(id));
+    return _defaultsCache[id];
+  }
+
+  function readTemplateDefaults(templateId) {
+    const out = { _fields: {}, subsidiary: '', name: '' };
+    if (!templateId) return out;
+
+    try {
+      const t = record.load({
+        type: record.Type.ASSEMBLY_ITEM, id: templateId, isDynamic: false
+      });
+
+      out.name = t.getValue({ fieldId: 'itemid' }) || templateId;
+      const sub = t.getValue({ fieldId: 'subsidiary' });
+      out.subsidiary = Array.isArray(sub) ? sub[0] : sub;
+
+      const skip = {};
+      for (const s of CFG.SKIP_FIELDS) skip[s] = true;
+      for (const s of CFG.DESCRIPTION_FIELDS) skip[s] = true;
+
+      // Catch-all: whatever text the template carries in its description
+      // fields must not ride along on ANY other field. This is what stops
+      // "TEMPLATE - 4000 ENT SQ SD..." leaking through a field that isn't
+      // named in DESCRIPTION_FIELDS.
+      const tplDescText = [];
+      for (const f of CFG.DESCRIPTION_FIELDS) {
+        try {
+          const v = t.getValue({ fieldId: f });
+          if (v && typeof v === 'string' && v.trim()) tplDescText.push(normName(v));
+        } catch (e) { /* field not on this record */ }
+      }
+      const bled = [];
+
+      const fields = t.getFields() || [];
+      for (const f of fields) {
+        if (skip[f]) continue;
+        let v;
+        try { v = t.getValue({ fieldId: f }); } catch (e) { continue; }
+        if (v === '' || v === null || v === undefined) continue;
+        if (Array.isArray(v) && !v.length) continue;
+        if (typeof v === 'string' && tplDescText.indexOf(normName(v)) !== -1) {
+          bled.push(f);
+          continue;
+        }
+        out._fields[f] = v;
+      }
+
+      if (bled.length) {
+        log.audit({
+          title: 'template description text blocked on extra fields',
+          details: templateId + ': ' + bled.join(', ')
+        });
+      }
+
+      log.audit({
+        title: 'template fields loaded',
+        details: Object.keys(out._fields).length + ' fields from item ' + templateId
+      });
+    } catch (e) {
+      log.error({ title: 'readTemplateDefaults ' + templateId, details: e.toString() });
+    }
+    return out;
+  }
+
+  function applyDefaults(item, defaults) {
+    const f = (defaults && defaults._fields) || {};
+    const skipped = [];
+    for (const key in f) {
+      try { item.setValue({ fieldId: key, value: f[key] }); }
+      catch (e) { skipped.push(key); }
+    }
+    if (skipped.length) {
+      log.audit({ title: 'template fields not settable', details: skipped.join(', ') });
+    }
+  }
+
+  // ─── INLINE HTML (scoped under #gny-dnb) ──────────────────────────────────
+  function escHtml(str) {
+    return String(str == null ? '' : str)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+
+  function buildInlineHtml() {
+    const notices = [];
+
+    function safeList(fn, label) {
+      try {
+        const rows = fn();
+        if (!rows.length) notices.push(label + ' list came back empty — check the execution log.');
+        return rows;
+      } catch (e) {
+        log.error({ title: 'buildInlineHtml ' + label, details: e.toString() });
+        notices.push(label + ' could not be loaded: ' + e.message);
+        return [];
+      }
+    }
+
+    const wcRows = safeList(listWorkCenters, 'Work center');
+    const ctRows = safeList(listCostTemplates, 'Cost template');
+    const clsRows = safeList(listClasses, 'Class');
+
+    const wc = JSON.stringify(wcRows);
+    const ct = JSON.stringify(ctRows);
+    const cls = JSON.stringify(clsRows);
+    const src = JSON.stringify(ITEM_SOURCES);
+
+    // Every catalog operation names a work center and a cost template. If one
+    // isn't in the account, picking that operation silently leaves the field
+    // on "— none —". Say so on load rather than at pick time.
+    const unresolved = [];
+    for (const fam in OPERATIONS) {
+      for (const o of OPERATIONS[fam]) {
+        const missing = [];
+        if (!matchNameToId(wcRows, o.wc)) missing.push('work center "' + o.wc + '"');
+        if (!matchNameToId(ctRows, o.ct)) missing.push('cost template "' + o.ct + '"');
+        if (missing.length) unresolved.push(fam + '/' + o.op + ' — no ' + missing.join(', '));
+      }
+    }
+    if (unresolved.length) {
+      notices.push('These catalog operations cannot fill themselves in: ' +
+                   unresolved.join('; ') +
+                   '. If a list looks stale, reload with ?refresh=1 on the URL.');
+    }
+
+    // Every series maps to a class. A series whose class can't be resolved
+    // would quietly build a door with the template's class instead.
+    const seriesOut = [];
+    const badSeries = [];
+    for (const s of SERIES) {
+      const id = matchNameToId(clsRows, s.cls);
+      if (!id) badSeries.push(s.code + ' (' + s.cls + ')');
+      seriesOut.push({ code: s.code, cls: s.cls, classId: id });
+    }
+    if (badSeries.length) {
+      notices.push('These series have no matching class in this account: ' +
+                   badSeries.join(', ') + '. Pick the class by hand for those.');
+    }
+
+    let nextNum = '';
+    try { nextNum = nextDoorNumber(); } catch (e) { nextNum = ''; }
+    if (!nextNum) {
+      notices.push('Could not work out the next free door number — type one in.');
+    }
+
+    // Template status banner
+    let banner = '';
+    try {
+      const parts = [];
+      let anyMissing = false;
+      for (const f of ALL_FAMILIES) {
+        const id = CFG.TEMPLATE_ITEMS[f];
+        if (!id) { parts.push(FAMILY_LABEL[f] + ': none'); anyMissing = true; continue; }
+        const d = getTemplateDefaults(f);
+        const count = Object.keys(d._fields || {}).length;
+        if (!count) anyMissing = true;
+        parts.push(FAMILY_LABEL[f] + ': <a href="' + NS_ITEM + id + '" target="_blank">' +
+                   escHtml(d.name || id) + '</a> (' + count + ')');
+      }
+      banner = '<div class="tpl">Inheriting from ' + parts.join(' &middot; ') +
+               ' &middot; location <b>' + escHtml(CFG.LOCATION_NAME) + '</b>' +
+               ' &middot; ' + wcRows.length + ' work centers, ' + ctRows.length + ' cost templates' +
+               (nextNum ? ' &middot; next number <b>' + escHtml(nextNum) + '</b>' : '') +
+               (_cacheCleared ? ' &middot; <b>caches refreshed</b>' : '') +
+               '</div>';
+      if (anyMissing) {
+        notices.push('At least one template item could not be read. New items will be missing ' +
+                     'accounts, tax schedule and units.');
+      }
+    } catch (e) {
+      banner = '<div class="warn">Could not read the template items: ' + escHtml(e.message) + '</div>';
+    }
+
+    if (notices.length) {
+      banner += '<div class="warn">' + notices.map(n => escHtml(n)).join('<br>') +
+                '<br><span class="dim">You can still build — affected dropdowns will just be empty.</span>' +
+                '</div>';
+    }
+
+    const hideTitle = CFG.HIDE_NS_PAGE_TITLE ? '.uir-page-title{display:none}' : '';
+    const skipTab = CFG.SKIP_TAB_ON_PREFILLED ? ' tabindex="-1"' : '';
+
+    // Series dropdown
+    let seriesOptions = '<option value="">— pick —</option>';
+    for (const s of seriesOut) {
+      seriesOptions += '<option value="' + escHtml(s.code) + '">' + escHtml(s.code) +
+                       ' &nbsp; ' + escHtml(s.cls) + '</option>';
+    }
+
+    // One card per sub-assembly family, generated so frame/core/screen stay
+    // structurally identical and can't drift apart by hand-editing.
+    function famCard(f, n, note) {
+      const hidden = (f === 'S') ? ' style="display:none"' : '';
+      return `
+<div class="card fam-card" id="dnb-card-${f}"${hidden}>
+  <div class="card-head">
+    <span class="card-title">${n} &nbsp;${escHtml(FAMILY_LABEL[f])}</span>
+    <span class="card-note" id="dnb-note-${f}">${escHtml(note)}</span>
+  </div>
+  <div class="card-body">
+    <div class="fam-num" id="dnb-num-${f}">&nbsp;</div>
+
+    <div class="sub-label">Components</div>
+    <div class="twrap comp-wrap">
+    <table>
+      <thead><tr>
+        <th style="width:56%">Component</th>
+        <th class="r" style="width:14%">Qty</th>
+        <th style="width:24%">Item source</th>
+        <th style="width:6%"></th>
+      </tr></thead>
+      <tbody id="dnb-compBody-${f}"></tbody>
+    </table>
+    </div>
+    <button type="button" class="btn-add tabstop" onclick="GNYDNB.addComponent('${f}', true)">+ Add component</button>
+
+    <div class="sub-label" style="margin-top:14px">Routing steps</div>
+    <div class="twrap">
+    <table>
+      <thead><tr>
+        <th class="r" style="width:8%">Seq</th>
+        <th style="width:22%">Operation</th>
+        <th style="width:24%">Work center</th>
+        <th style="width:24%">Cost template</th>
+        <th class="r" style="width:8%">Run</th>
+        <th class="r" style="width:8%">Setup</th>
+        <th style="width:6%"></th>
+      </tr></thead>
+      <tbody id="dnb-stepBody-${f}"></tbody>
+    </table>
+    </div>
+    <button type="button" class="btn-add tabstop" onclick="GNYDNB.addStep('${f}', true)">+ Add step</button>
+
+    <div class="grid g2" style="margin-top:10px;display:none" id="dnb-editRev-${f}">
+      <div>
+        <label for="dnb-newRevName-${f}">New BOM rev name</label>
+        <input id="dnb-newRevName-${f}" autocomplete="off">
+      </div>
+      <div>
+        <label for="dnb-curRevName-${f}">Current revision</label>
+        <input id="dnb-curRevName-${f}" readonly tabindex="-1" style="background:#eee;color:#555">
+      </div>
+    </div>
+  </div>
+</div>`;
+    }
+
+    return `<div id="${WRAP}">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+${hideTitle}
+
+/* Everything below is scoped to #${WRAP} so it cannot affect NetSuite's UI. */
+#${WRAP}{
+  --dnb-bg:#e8e8e8; --dnb-surface:#d0d0d0; --dnb-border:#b0b0b0; --dnb-bhi:#888;
+  --dnb-text:#1a1a1a; --dnb-muted:#666; --dnb-dim:#999;
+  --dnb-blue:#1a5fa8; --dnb-teal:#1a7a58; --dnb-red:#a02020; --dnb-amber:#8a6500;
+  --dnb-font:'Inter',system-ui,sans-serif; --dnb-mono:'JetBrains Mono',monospace;
+  font-family:var(--dnb-font); font-size:12px; color:var(--dnb-text);
+  background:var(--dnb-bg); border:1px solid var(--dnb-border); border-radius:6px;
+  padding:16px; margin:8px 0 32px; width:100%;
+  /* NetSuite's own content table can be wider than the window, and width:100%
+     of an over-wide parent overflows with it. Clamping to the viewport keeps
+     this tool inside the screen no matter what the page around it does. */
+  max-width:1180px; max-width:min(1180px, calc(100vw - 24px));
+}
+#${WRAP} *,#${WRAP} *::before,#${WRAP} *::after{box-sizing:border-box}
+#${WRAP} h3{margin:0 0 8px;font-size:13px}
+#${WRAP} ul{list-style:none;margin:0;padding:0}
+#${WRAP} .dim{color:#666}
+
+#${WRAP} .warn{background:#fff8e0;border:1px solid #e0c060;border-radius:5px;
+  padding:10px 14px;color:var(--dnb-amber);margin-bottom:14px}
+#${WRAP} .tpl{background:#eef4fa;border:1px solid #a8c4e0;border-radius:5px;
+  padding:8px 14px;color:#2a4a68;margin-bottom:14px;font-family:var(--dnb-mono);font-size:10px}
+#${WRAP} .tpl,#${WRAP} .warn,#${WRAP} .edit-banner,#${WRAP} .hint,
+#${WRAP} .card-note,#${WRAP} .result li{overflow-wrap:anywhere}
+#${WRAP} .tpl b{font-weight:500}
+#${WRAP} .tpl a{color:var(--dnb-blue)}
+
+#${WRAP} .card{background:var(--dnb-surface);border:1px solid var(--dnb-border);
+  border-radius:6px;margin-bottom:14px;overflow:visible}
+#${WRAP} .card-head{padding:9px 16px;border-bottom:1px solid var(--dnb-border);
+  display:flex;align-items:baseline;gap:10px;background:#c6c6c6;flex-wrap:wrap}
+#${WRAP} .card-title{font-family:var(--dnb-mono);font-size:10px;text-transform:uppercase;
+  letter-spacing:.12em;color:#333;font-weight:500}
+#${WRAP} .card-note{font-size:11px;color:var(--dnb-muted);min-width:0;flex:1 1 auto}
+#${WRAP} .card-body{padding:14px 16px}
+#${WRAP} .sub-label{font-family:var(--dnb-mono);font-size:9px;text-transform:uppercase;
+  letter-spacing:.1em;color:var(--dnb-muted);margin-bottom:5px}
+/* The derived part number for each family, shown so the cascade is never a
+   surprise — you type one number and four items come out. */
+#${WRAP} .fam-num{font-family:var(--dnb-mono);font-size:11px;color:var(--dnb-blue);
+  margin-bottom:10px;overflow-wrap:anywhere}
+#${WRAP} .fam-num a{color:var(--dnb-blue)}
+
+#${WRAP} .grid{display:grid;gap:12px}
+#${WRAP} .grid > *{min-width:0}
+#${WRAP} .g4{grid-template-columns:1fr 1fr 2fr 1fr}
+#${WRAP} .g3{grid-template-columns:repeat(3,1fr)}
+#${WRAP} .g2{grid-template-columns:1fr 1fr}
+@media(max-width:900px){#${WRAP} .g4,#${WRAP} .g3,#${WRAP} .g2{grid-template-columns:1fr}}
+
+#${WRAP} label{display:block;font-family:var(--dnb-mono);font-size:9px;text-transform:uppercase;
+  letter-spacing:.1em;color:var(--dnb-muted);margin-bottom:4px}
+#${WRAP} input,#${WRAP} select,#${WRAP} textarea{width:100%;font-family:var(--dnb-mono);font-size:12px;
+  padding:6px 10px;border-radius:4px;border:1px solid var(--dnb-border);background:#fff;
+  color:var(--dnb-text);outline:none;transition:border-color .15s;height:auto}
+#${WRAP} textarea{min-height:96px;line-height:1.5;resize:vertical}
+#${WRAP} input:focus,#${WRAP} select:focus,#${WRAP} textarea:focus{border-color:var(--dnb-blue)}
+#${WRAP} input:focus-visible,#${WRAP} select:focus-visible,#${WRAP} button:focus-visible{
+  outline:2px solid var(--dnb-blue);outline-offset:1px}
+
+/* Explicit grid tracks, not flex. A flex-basis is a STARTING size that wide
+   content can still argue with; a fixed grid track cannot be widened by what
+   is inside it. minmax(0,1fr) is what stops the form column refusing to
+   shrink below the natural width of its own tables. */
+#${WRAP} .dnb-layout{display:grid;grid-template-columns:minmax(0,1fr) 268px;
+  gap:14px;align-items:start}
+#${WRAP} .dnb-main{min-width:0}
+#${WRAP} .dnb-side{min-width:0;width:268px;max-width:268px;position:sticky;top:8px}
+#${WRAP} .dnb-side .card{overflow:hidden}
+@media(max-width:900px){
+  #${WRAP} .dnb-layout{grid-template-columns:minmax(0,1fr)}
+  #${WRAP} .dnb-side{width:100%;max-width:100%;position:static}
+  #${WRAP} .dnb-side .card-body{max-height:none}
+}
+#${WRAP} .dnb-side .card-body{padding:8px;max-height:70vh;overflow-y:auto}
+#${WRAP} .recent-empty{font-size:11px;color:var(--dnb-muted);font-style:italic;padding:8px 6px}
+#${WRAP} .recent{background:#fff;border:1px solid #ddd;border-left:3px solid var(--dnb-teal);
+  border-radius:4px;padding:7px 9px;margin-bottom:6px;overflow:hidden;min-width:0}
+#${WRAP} .recent.fresh{border-left-color:var(--dnb-blue);background:#f4f9ff}
+/* Edits are the same shape as builds but a different colour, so a glance at
+   the rail says which entries created records and which changed them. */
+#${WRAP} .recent.edited{border-left-color:var(--dnb-amber)}
+#${WRAP} .recent.edited.fresh{background:#fffaf0}
+#${WRAP} .recent-top{display:flex;justify-content:space-between;align-items:baseline;gap:6px;min-width:0}
+#${WRAP} .recent-part{font-family:var(--dnb-mono);font-size:11px;font-weight:500;
+  min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#${WRAP} .recent-part a{color:var(--dnb-blue);text-decoration:none}
+#${WRAP} .recent-part a:hover{text-decoration:underline}
+#${WRAP} .recent-meta{display:flex;align-items:baseline;gap:5px;white-space:nowrap;flex:0 0 auto}
+#${WRAP} .recent-tag{font-family:var(--dnb-mono);font-size:8px;letter-spacing:.08em;
+  border:1px solid #ccc;border-radius:3px;padding:0 4px;color:#666;background:#fafafa}
+#${WRAP} .recent-tag.t-updated,#${WRAP} .recent-tag.t-revised{
+  color:var(--dnb-amber);border-color:#e0c060;background:#fffaf0}
+#${WRAP} .recent-time{font-family:var(--dnb-mono);font-size:9px;color:var(--dnb-dim);white-space:nowrap}
+#${WRAP} .recent-desc{font-size:10px;color:var(--dnb-muted);margin-top:2px;max-width:100%;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#${WRAP} .recent-links{display:flex;gap:5px;margin-top:5px;flex-wrap:wrap;min-width:0}
+#${WRAP} .recent-links a{font-family:var(--dnb-mono);font-size:9px;color:#555;
+  border:1px solid #ddd;border-radius:3px;padding:1px 5px;text-decoration:none;background:#fafafa;
+  overflow-wrap:anywhere}
+#${WRAP} .recent-links a:hover{background:var(--dnb-surface);color:var(--dnb-text)}
+#${WRAP} .recent-clear{margin-top:4px;font-size:10px;padding:4px 10px}
+
+#${WRAP} input.bad,#${WRAP} select.bad{border-color:var(--dnb-red);background:#fff4f4}
+#${WRAP} .hint{font-family:var(--dnb-mono);font-size:10px;color:var(--dnb-dim);
+  margin-top:4px;min-height:13px}
+#${WRAP} .hint.bad{color:var(--dnb-red)}
+#${WRAP} .hint.good{color:var(--dnb-teal)}
+
+#${WRAP} table{width:100%;border-collapse:separate;border-spacing:0 3px;margin:0}
+/* Routing has 7 columns and cannot usefully shrink below this — let it scroll
+   inside its own box rather than pushing the whole page sideways. */
+#${WRAP} .twrap{overflow-x:auto;overflow-y:visible;padding-bottom:2px;max-width:100%}
+#${WRAP} .twrap table{min-width:640px}
+/* An element with overflow-x:auto clips its children VERTICALLY as well — the
+   browser forces overflow-y to auto — which traps the autocomplete dropdown
+   inside the scroll box. So the component table does not scroll: it shrinks,
+   and only starts scrolling below 700px where there is genuinely no room. */
+#${WRAP} .comp-wrap{overflow:visible}
+#${WRAP} .comp-wrap table{min-width:0}
+#${WRAP} td .ac-list{z-index:10000}
+#${WRAP} th{font-family:var(--dnb-mono);font-size:9px;text-transform:uppercase;
+  letter-spacing:.1em;color:#555;text-align:left;padding:0 8px 5px;font-weight:500;background:none}
+#${WRAP} th.r{text-align:right}
+#${WRAP} td{background:#fff;padding:5px 8px;border-top:1px solid #ddd;border-bottom:1px solid #ddd}
+#${WRAP} td:first-child{border-left:3px solid var(--dnb-bhi);border-radius:4px 0 0 4px}
+#${WRAP} td:last-child{border-right:1px solid #ddd;border-radius:0 4px 4px 0}
+#${WRAP} td input,#${WRAP} td select{border-color:#ddd;padding:5px 8px}
+#${WRAP} .num{text-align:right}
+#${WRAP} .chk{width:auto;display:inline-block}
+
+/* The door's own sub-assembly lines. Shown, never editable — deleting the
+   frame out of a door by clearing a grid row is not a thing that should be
+   possible from here. */
+#${WRAP} .sub-lines{background:#fff;border:1px solid #ddd;border-left:3px solid var(--dnb-blue);
+  border-radius:4px;padding:8px 10px;margin-bottom:10px}
+#${WRAP} .sub-line{font-family:var(--dnb-mono);font-size:11px;padding:2px 0;
+  display:flex;gap:8px;align-items:baseline;overflow-wrap:anywhere}
+#${WRAP} .sub-line .sl-qty{color:var(--dnb-muted);white-space:nowrap}
+#${WRAP} .sub-line .sl-src{color:var(--dnb-dim);font-size:9px;white-space:nowrap}
+#${WRAP} .sub-line a{color:var(--dnb-blue)}
+
+#${WRAP} .ac-wrap{position:relative}
+#${WRAP} .ac-list{position:absolute;top:calc(100% + 3px);left:0;right:0;background:#fff;
+  border:1px solid var(--dnb-border);border-radius:5px;box-shadow:0 4px 16px rgba(0,0,0,.15);
+  z-index:9999;max-height:260px;overflow-y:auto;display:none;
+  min-width:100%;width:max-content;max-width:min(460px,80vw)}
+#${WRAP} .ac-list.open{display:block}
+#${WRAP} .ac-item{padding:6px 10px;cursor:pointer;font-family:var(--dnb-mono);font-size:11px;
+  border-bottom:1px solid #eee;display:flex;gap:8px}
+#${WRAP} .ac-item:last-child{border-bottom:none}
+#${WRAP} .ac-item:hover,#${WRAP} .ac-item.active{background:#e8f0fc}
+#${WRAP} .ac-id{font-weight:500;color:var(--dnb-blue);white-space:nowrap}
+#${WRAP} .ac-desc{color:var(--dnb-muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+#${WRAP} button{font-family:var(--dnb-font);font-size:11px;font-weight:500;padding:6px 14px;
+  border-radius:4px;border:1px solid var(--dnb-bhi);background:#fff;color:#333;cursor:pointer;
+  transition:background .12s;width:auto}
+#${WRAP} button:hover{background:var(--dnb-surface)}
+#${WRAP} .btn-x{border:none;background:transparent;color:var(--dnb-dim);font-size:14px;
+  padding:2px 6px;line-height:1}
+#${WRAP} .btn-x:hover{color:var(--dnb-red);background:transparent}
+#${WRAP} .btn-add{margin-top:8px}
+#${WRAP} .btn-primary{background:#2a2a2a;color:#f0f0f0;border:none;padding:9px 26px;font-size:12px}
+#${WRAP} .btn-primary:hover{background:#444}
+#${WRAP} .btn-primary:disabled{background:#999;cursor:not-allowed}
+#${WRAP} .btn-secondary{background:#fff;color:#2a2a2a;border:1px solid #888;padding:9px 22px;font-size:12px}
+#${WRAP} .btn-secondary:hover{background:#eee}
+#${WRAP} .btn-secondary:disabled{background:#eee;color:#999;cursor:not-allowed}
+
+#${WRAP} .edit-banner{background:#eef4fa;border:1px solid #a8c4e0;border-radius:5px;
+  padding:8px 14px;color:#2a4a68;margin-bottom:14px;font-family:var(--dnb-mono);font-size:10px;
+  display:none}
+#${WRAP} .edit-banner.open{display:block}
+
+#${WRAP} .inline-lbl{display:inline-flex;align-items:center;gap:6px;margin-right:16px;
+  text-transform:none;letter-spacing:0;font-family:var(--dnb-font);font-size:11px;color:var(--dnb-text)}
+#${WRAP} .actions{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-top:4px;min-width:0}
+#${WRAP} .preview{font-family:var(--dnb-mono);font-size:10px;color:var(--dnb-muted);
+  line-height:1.7;min-width:0;overflow-wrap:anywhere}
+#${WRAP} .preview b{color:var(--dnb-text);font-weight:500}
+
+#${WRAP} .result{border-radius:6px;padding:14px 16px;margin-bottom:14px;display:none}
+#${WRAP} .result.open{display:block}
+#${WRAP} .result.ok{background:#eef8f2;border:1px solid #8ccfae}
+#${WRAP} .result.err{background:#fff0f0;border:1px solid #ffaaaa}
+#${WRAP} .result.ok h3{color:var(--dnb-teal)}
+#${WRAP} .result.err h3{color:var(--dnb-red)}
+#${WRAP} .result li{font-family:var(--dnb-mono);font-size:11px;line-height:1.9}
+#${WRAP} .result a{color:var(--dnb-blue)}
+@media (prefers-reduced-motion:reduce){#${WRAP} *{transition:none !important}}
+
+/* Half-screen laptop: reclaim horizontal space before anything overflows. */
+@media(max-width:900px){
+  #${WRAP}{padding:10px;font-size:11px;max-width:calc(100vw - 16px)}
+  #${WRAP} .card-body{padding:10px}
+  #${WRAP} .card-head{padding:7px 10px}
+  #${WRAP} .card-note{display:none}
+  #${WRAP} td{padding:4px 5px}
+  #${WRAP} th{padding:0 5px 4px}
+  #${WRAP} input,#${WRAP} select,#${WRAP} textarea{padding:5px 7px}
+  #${WRAP} td input,#${WRAP} td select{padding:4px 5px;font-size:11px}
+  #${WRAP} .twrap table{min-width:560px}
+}
+@media(max-width:700px){
+  #${WRAP} .twrap table{min-width:480px}
+  /* Below this width the component row genuinely cannot fit, so it scrolls.
+     The dropdown gets clipped while it does — the alternative is the row
+     running off the screen, which is worse. */
+  #${WRAP} .comp-wrap{overflow-x:auto}
+  #${WRAP} .comp-wrap table{min-width:340px}
+  #${WRAP} .ac-list{max-width:calc(100vw - 40px)}
+}
+@media(max-width:620px){
+  #${WRAP} .actions{flex-direction:column;align-items:stretch}
+  #${WRAP} .preview{order:-1}
+}
+</style>
+
+${banner}
+<div class="dnb-layout">
+<div class="dnb-main">
+
+<div class="edit-banner" id="dnb-editBanner"></div>
+<div class="result" id="dnb-result"></div>
+
+<div class="card">
+  <div class="card-head">
+    <span class="card-title">1 &nbsp;Door</span>
+    <span class="card-note" id="dnb-doorNote">Pick a series and take the next number, or type an existing door number to load it.</span>
+  </div>
+  <div class="card-body">
+    <div class="grid g4">
+      <div>
+        <label for="dnb-series">Series</label>
+        <select id="dnb-series" class="tabstop">${seriesOptions}</select>
+      </div>
+      <div>
+        <label for="dnb-number">Door number</label>
+        <div class="ac-wrap">
+          <input id="dnb-number" class="tabstop" autocomplete="off">
+          <div class="ac-list" id="dnb-doorAc"></div>
+        </div>
+        <div class="hint" id="dnb-numberHint">&nbsp;</div>
+      </div>
+      <div>
+        <label for="dnb-desc">Description</label>
+        <input id="dnb-desc" class="tabstop" autocomplete="off">
+        <div class="hint" id="dnb-descHint">&nbsp;</div>
+      </div>
+      <div>
+        <label for="dnb-class">Class</label>
+        <select id="dnb-class"${skipTab}></select>
+        <div class="hint" id="dnb-classHint">&nbsp;</div>
+      </div>
+    </div>
+
+    <div class="grid g3" style="margin-top:4px" id="dnb-newOnlyRow">
+      <div>
+        <label for="dnb-rev">Revision</label>
+        <select id="dnb-rev"${skipTab}></select>
+      </div>
+      <div>
+        <label for="dnb-date">Revision effective date</label>
+        <input id="dnb-date" autocomplete="off"${skipTab}>
+      </div>
+      <div>
+        <label>&nbsp;</label>
+        <label class="inline-lbl">
+          <input type="checkbox" class="chk" id="dnb-screen" onchange="GNYDNB.toggleScreen()">
+          Include screen door
+        </label>
+      </div>
+    </div>
+
+    <div class="grid g2" style="margin-top:10px">
+      <div>
+        <label for="dnb-cut">Cut details</label>
+        <textarea id="dnb-cut" tabindex="-1" placeholder="(Outer W - )&#10;(Outer H - )&#10;(Inner W - )&#10;(Inner H - )&#10;(Panel W - )&#10;(Panel H - )&#10;(H-Bar - )"></textarea>
+        <div class="hint">Door only. Left blank on the frame, core and screen.</div>
+      </div>
+      <div>
+        <label for="dnb-preview-box">What gets built</label>
+        <div class="preview" id="dnb-preview-box" style="background:#fff;border:1px solid var(--dnb-border);border-radius:4px;padding:8px 10px;min-height:96px"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-head">
+    <span class="card-title">2 &nbsp;Door BOM</span>
+    <span class="card-note">The sub-assemblies go on automatically. Add loose hardware that isn't part of one.</span>
+  </div>
+  <div class="card-body">
+    <div class="fam-num" id="dnb-num-DR">&nbsp;</div>
+    <div class="sub-lines" id="dnb-subLines"></div>
+
+    <div class="sub-label">Loose hardware</div>
+    <div class="twrap comp-wrap">
+    <table>
+      <thead><tr>
+        <th style="width:56%">Component</th>
+        <th class="r" style="width:14%">Qty</th>
+        <th style="width:24%">Item source</th>
+        <th style="width:6%"></th>
+      </tr></thead>
+      <tbody id="dnb-compBody-DR"></tbody>
+    </table>
+    </div>
+    <button type="button" class="btn-add tabstop" onclick="GNYDNB.addComponent('DR', true)">+ Add hardware</button>
+
+    <div class="grid g2" style="margin-top:10px;display:none" id="dnb-editRev-DR">
+      <div>
+        <label for="dnb-newRevName-DR">New BOM rev name</label>
+        <input id="dnb-newRevName-DR" autocomplete="off">
+      </div>
+      <div>
+        <label for="dnb-curRevName-DR">Current revision</label>
+        <input id="dnb-curRevName-DR" readonly tabindex="-1" style="background:#eee;color:#555">
+      </div>
+    </div>
+  </div>
+</div>
+
+${famCard('F', 3, 'Outer extrusion, seal, hinges. Cut then weld, or cut then bend.')}
+${famCard('C', 4, 'Inner extrusion, skins, foam, adhesive, hardware. Cut, laminate, route.')}
+${famCard('S', 5, 'Screen frame extrusion, mesh, hardware. Usually cut only.')}
+
+<div class="actions">
+  <button type="button" class="btn-primary tabstop" id="dnb-submit" onclick="GNYDNB.submit()">Create door</button>
+  <button type="button" class="btn-secondary tabstop" id="dnb-newRevBtn" style="display:none" onclick="GNYDNB.submitNewRev()">Save as new BOM revs</button>
+  <label class="inline-lbl">
+    <input type="checkbox" class="chk" id="dnb-autoIssue" tabindex="-1">
+    Auto-issue components
+  </label>
+  <div class="preview" id="dnb-preview"></div>
+</div>
+</div>
+
+<aside class="dnb-side">
+  <div class="card">
+    <div class="card-head">
+      <span class="card-title">Recent activity</span>
+      <span class="card-note" id="dnb-recentCount"></span>
+    </div>
+    <div class="card-body" id="dnb-recentBody">
+      <div class="recent-empty">Nothing built or edited yet.</div>
+    </div>
+  </div>
+</aside>
+</div>
+
+<script>
+// All logic lives on one global namespace so it cannot collide with
+// NetSuite's own page scripts.
+var GNYDNB = (function(){
+  var WORK_CENTERS = ${wc};
+  var COST_TEMPLATES = ${ct};
+  var CLASSES = ${cls};
+  var ITEM_SOURCES = ${src};
+  var SERIES = ${JSON.stringify(seriesOut)};
+  var OPERATIONS = ${JSON.stringify(OPERATIONS)};
+  var DEFAULT_STEPS = ${JSON.stringify(DEFAULT_STEPS)};
+  var DEFAULT_COMPONENT_ROWS = ${JSON.stringify(DEFAULT_COMPONENT_ROWS)};
+  var FAMILY_PREFIX = ${JSON.stringify(CFG.FAMILY_PREFIX)};
+  var DESC_PREFIX = ${JSON.stringify(CFG.DESC_PREFIX)};
+  var REV_NAME_SEP = ${JSON.stringify(CFG.REV_NAME_SEP)};
+  var BUILDS_ROUTING = ${JSON.stringify(CFG.BUILDS_ROUTING)};
+  var FAMILY_LABEL = ${JSON.stringify(FAMILY_LABEL)};
+  var DR_COMPONENT_ORDER = ${JSON.stringify(CFG.DR_COMPONENT_ORDER)};
+  var DR_SUBASSEMBLY_SOURCE = ${JSON.stringify(CFG.DR_SUBASSEMBLY_SOURCE)};
+  var SOURCE_BY_ITEMTYPE = ${JSON.stringify(SOURCE_BY_ITEMTYPE)};
+  var SOURCE_FALLBACK = ${JSON.stringify(SOURCE_FALLBACK)};
+  var SERIES_IN_DESC = ${CFG.SERIES_IN_DESC ? 'true' : 'false'};
+  var NEXT_NUMBER = ${JSON.stringify(nextNum)};
+  var DATE_OFFSET = ${CFG.EFFECTIVE_DATE_OFFSET_DAYS};
+  var AUTO_RESET = ${CFG.AUTO_RESET ? 'true' : 'false'};
+  var AUTO_ISSUE_DEFAULT = ${CFG.AUTO_ISSUE_DEFAULT ? 'true' : 'false'};
+  var INCLUDE_SCREEN_DEFAULT = ${CFG.INCLUDE_SCREEN_DEFAULT ? 'true' : 'false'};
+  var RECENT_LIMIT = ${CFG.RECENT_LIMIT};
+  var RECENT_KEY = 'gny_dnb_recent';
+  var SEARCH_MIN_CHARS = ${CFG.SEARCH_MIN_CHARS};
+  var NUMBER_WIDTH = ${CFG.NUMBER_WIDTH};
+
+  var SUB_FAMILIES = ['F', 'C', 'S'];
+  var ALL_FAMILIES = ['DR', 'F', 'C', 'S'];
+  var DOOR_NOTE_NEW =
+    'Pick a series and take the next number, or type an existing door number to load it.';
+
+  var root;
+  var rowCount = { DR:0, F:0, C:0, S:0 };
+  var stepCount = { F:0, C:0, S:0 };
+  var acTimers = {}, acData = {}, acActive = {}, acQueryCache = {};
+
+  // ── mode ────────────────────────────────────────────────────────────────
+  var mode = 'new';          // 'new' | 'edit'
+  var editData = null;       // last loaddoor response
+  var doorAcTimer = null, doorAcData = [], doorAcActive = -1;
+
+  // Clicking a dropdown row must not be beaten by the blur handler firing
+  // against the TYPED text. acClicking suppresses the blur path while a row is
+  // being clicked; numReqSeq makes every checkdoor/loaddoor response
+  // last-writer-wins, so no stale request can overwrite a newer selection.
+  var acClicking = false;
+  var numReqSeq = 0;
+
+  function \$(id){ return document.getElementById(id); }
+
+  function esc(s){
+    return String(s == null ? '' : s).replace(/&/g,'&amp;').replace(/</g,'&lt;')
+      .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+
+  function norm(s){
+    return String(s == null ? '' : s).replace(/\\s+/g,' ').trim().toUpperCase();
+  }
+
+  function optionsHtml(arr, valKey, labKey, blank){
+    var h = blank ? '<option value="">' + blank + '</option>' : '';
+    for (var i=0;i<arr.length;i++){
+      h += '<option value="' + esc(arr[i][valKey]) + '">' + esc(arr[i][labKey]) + '</option>';
+    }
+    return h;
+  }
+
+  function baseUrl(){
+    var p = new URLSearchParams(window.location.search);
+    // refresh is a one-shot page-load flag; carrying it on every XHR would
+    // clear the caches over and over and make the tool slower, not faster.
+    p.delete('api'); p.delete('term'); p.delete('refresh');
+    return window.location.origin + window.location.pathname + '?' + p.toString();
+  }
+
+  function setHint(id, text, cls){
+    var el = \$(id);
+    if (!el) return;
+    el.textContent = text || '\\u00A0';
+    el.className = 'hint' + (cls ? ' ' + cls : '');
+  }
+
+  function activeFamilies(){
+    var out = ['F', 'C'];
+    if (\$('dnb-screen').checked) out.push('S');
+    return out;
+  }
+
+  function partNumberFor(fam){
+    var s = \$('dnb-series').value;
+    var n = \$('dnb-number').value.trim();
+    if (!s || !n) return '';
+    return FAMILY_PREFIX[fam] + s + '-' + n;
+  }
+
+  // ── series / class ──────────────────────────────────────────────────────
+  // Every series maps to a class, taken from what the 3,183 live doors
+  // actually use. The dropdown stays editable — one-off exceptions exist.
+  var classUserSet = false;
+
+  function onSeriesChange(){
+    if (!classUserSet){
+      var s = \$('dnb-series').value;
+      var row = null;
+      for (var i=0;i<SERIES.length;i++){ if (SERIES[i].code === s){ row = SERIES[i]; break; } }
+      if (row && row.classId){
+        \$('dnb-class').value = row.classId;
+        setHint('dnb-classHint', 'From series ' + s, '');
+      } else if (row){
+        setHint('dnb-classHint', 'No class matched "' + row.cls + '" — pick one.', 'bad');
+      } else {
+        setHint('dnb-classHint', '', '');
+      }
+    }
+    syncDescriptionSeries();
+    refreshNumbers();
+    updatePreview();
+  }
+
+  function markClassManual(){
+    classUserSet = true;
+    setHint('dnb-classHint', 'Set by hand', '');
+  }
+
+  // The description opens with the series number on 3,126 of 3,182 live
+  // doors. Swap the leading series when the series changes rather than
+  // leaving the old one stranded at the front of the text.
+  function syncDescriptionSeries(){
+    if (!SERIES_IN_DESC || mode === 'edit') return;
+    var s = \$('dnb-series').value;
+    if (!s) return;
+    var d = \$('dnb-desc').value;
+    var m = d.match(/^([0-9]{3,5})\\s+/);
+    if (m){
+      \$('dnb-desc').value = s + ' ' + d.slice(m[0].length);
+    } else if (d.trim()){
+      \$('dnb-desc').value = s + ' ' + d.trim();
+    }
+    updatePreview();
+  }
+
+  // ── numbers ─────────────────────────────────────────────────────────────
+  function refreshNumbers(){
+    var subs = activeFamilies();
+    var all = ['DR'].concat(subs);
+    for (var i=0;i<ALL_FAMILIES.length;i++){
+      var f = ALL_FAMILIES[i];
+      var el = \$('dnb-num-' + f);
+      if (!el) continue;
+      if (all.indexOf(f) === -1){ el.innerHTML = '&nbsp;'; continue; }
+      var pn = partNumberFor(f);
+      if (mode === 'edit' && editData && editData.families[f]){
+        var u = editData.families[f];
+        el.innerHTML = '<a href="/app/common/item/item.nl?id=' + u.itemId + '" target="_blank">' +
+          esc(u.partNumber) + '</a> &middot; ' + esc(u.bomName || 'no BOM') +
+          (u.revName ? ' &middot; ' + esc(u.revName) : '');
+      } else {
+        el.innerHTML = pn
+          ? esc(pn) + ' &middot; ' + esc(pn + ' BOM') + ' &middot; ' +
+            esc(pn + REV_NAME_SEP[f] + \$('dnb-rev').value) +
+            (BUILDS_ROUTING[f] ? ' &middot; ' + esc(pn + ' ROUTING') : '')
+          : '&nbsp;';
+      }
+    }
+    renderSubLines();
+  }
+
+  // The door's own BOM lines for its sub-assemblies. Rendered read-only so
+  // nobody can drop the frame out of a door by clearing a grid row.
+  function renderSubLines(){
+    var box = \$('dnb-subLines');
+    if (!box) return;
+    var h = '';
+
+    if (mode === 'edit' && editData){
+      var lines = (editData.families.DR && editData.families.DR.subLines) || [];
+      if (!lines.length){
+        box.innerHTML = '<div class="sub-line dim">This door has no sub-assembly lines on its BOM.</div>';
+        return;
+      }
+      for (var i=0;i<lines.length;i++){
+        var l = lines[i];
+        h += '<div class="sub-line">' +
+             '<span>' + esc(l.itemNumber) + '</span>' +
+             '<span class="sl-qty">x' + esc(l.quantity) + '</span>' +
+             '<span class="sl-src">' + esc(l.itemSource) + '</span>' +
+             '</div>';
+      }
+      box.innerHTML = h;
+      return;
+    }
+
+    var subs = activeFamilies();
+    for (var k=0;k<DR_COMPONENT_ORDER.length;k++){
+      var f = DR_COMPONENT_ORDER[k];
+      if (subs.indexOf(f) === -1) continue;
+      var pn = partNumberFor(f);
+      h += '<div class="sub-line">' +
+           '<span>' + (pn ? esc(pn) : '&lt;' + esc(FAMILY_LABEL[f].toLowerCase()) + '&gt;') + '</span>' +
+           '<span class="sl-qty">x1</span>' +
+           '<span class="sl-src">' + esc(DR_SUBASSEMBLY_SOURCE) + '</span>' +
+           '</div>';
+    }
+    box.innerHTML = h || '<div class="sub-line dim">No sub-assemblies selected.</div>';
+  }
+
+  function onNumberInput(){
+    var el = \$('dnb-number');
+    el.value = el.value.toUpperCase();
+    doorAcInput();
+    if (mode === 'edit' && editData){
+      setHint('dnb-numberHint', 'Press Enter or tab out to load this number.', '');
+      return;
+    }
+    setHint('dnb-numberHint', '', '');
+    el.classList.remove('bad');
+    refreshNumbers();
+    updatePreview();
+  }
+
+  // Blur is the catch-all trigger: an existing number loads, a free one keeps
+  // building. It must NOT run while a dropdown row is being clicked — the row
+  // the person picked, not the text they typed, is the intent.
+  function checkNumber(){
+    if (acClicking) return;
+    var val = \$('dnb-number').value.trim();
+    if (!val) return;
+    if (mode === 'edit' && editData && val === String(editData.number || '')) return;
+
+    var seq = ++numReqSeq;
+    var xhr = new XMLHttpRequest();
+    xhr.open('GET', baseUrl() + '&api=checkdoor&term=' + encodeURIComponent(val), true);
+    xhr.onload = function(){
+      if (seq !== numReqSeq) return;
+      try {
+        var t = xhr.responseText, s = t.indexOf('{'), e = t.lastIndexOf('}');
+        if (s === -1) return;
+        var r = JSON.parse(t.slice(s, e+1));
+        if (!r.ok) return;
+        if (r.exists){
+          setHint('dnb-numberHint', 'Already built (' + esc(r.doorNumber || val) + ') — loading…', '');
+          loadDoor(val);
+        } else {
+          \$('dnb-number').classList.remove('bad');
+          if (mode === 'edit') exitEditMode(val);
+          setHint('dnb-numberHint', 'Available', 'good');
+        }
+      } catch(err){}
+    };
+    xhr.send();
+  }
+
+  // ── door search dropdown ────────────────────────────────────────────────
+  function doorAcInput(){
+    clearTimeout(doorAcTimer);
+    var val = \$('dnb-number').value.trim();
+    if (val.length < SEARCH_MIN_CHARS){ doorAcClose(); return; }
+    doorAcTimer = setTimeout(function(){ doorAcFetch(val); }, 200);
+  }
+
+  function doorAcFetch(term){
+    var xhr = new XMLHttpRequest();
+    xhr.open('GET', baseUrl() + '&api=doors&term=' + encodeURIComponent(term), true);
+    xhr.onload = function(){
+      try {
+        var t = xhr.responseText, s = t.indexOf('['), e = t.lastIndexOf(']');
+        if (s === -1){ doorAcClose(); return; }
+        doorAcData = JSON.parse(t.slice(s, e+1));
+        doorAcRender();
+      } catch(err){ doorAcClose(); }
+    };
+    xhr.onerror = function(){ doorAcClose(); };
+    xhr.send();
+  }
+
+  function doorAcRender(){
+    var list = \$('dnb-doorAc');
+    if (!doorAcData.length){ doorAcClose(); return; }
+    var h = '';
+    for (var k=0;k<doorAcData.length;k++){
+      h += '<div class="ac-item" onclick="GNYDNB.doorAcPick(' + k + ')">' +
+           '<span class="ac-id">' + esc(doorAcData[k].itemid) + '</span>' +
+           '<span class="ac-desc">' + esc(doorAcData[k].desc) + '</span></div>';
+    }
+    list.innerHTML = h;
+    list.classList.add('open');
+    doorAcActive = -1;
+  }
+
+  function doorAcKey(e){
+    var list = \$('dnb-doorAc');
+    if (!list.classList.contains('open')) return false;
+    var items = list.querySelectorAll('.ac-item');
+    if (e.key === 'ArrowDown'){
+      doorAcActive = Math.min(doorAcActive+1, items.length-1); doorAcHi(items); e.preventDefault(); return true;
+    } else if (e.key === 'ArrowUp'){
+      doorAcActive = Math.max(doorAcActive-1, 0); doorAcHi(items); e.preventDefault(); return true;
+    } else if (e.key === 'Enter'){
+      if (doorAcActive >= 0){ doorAcPick(doorAcActive); e.preventDefault(); return true; }
+    } else if (e.key === 'Escape'){
+      doorAcClose(); return true;
+    }
+    return false;
+  }
+
+  function doorAcHi(items){
+    for (var k=0;k<items.length;k++) items[k].classList.toggle('active', k === doorAcActive);
+    if (doorAcActive >= 0) items[doorAcActive].scrollIntoView({ block:'nearest' });
+  }
+
+  function doorAcPick(k){
+    var d = doorAcData[k];
+    if (!d) return;
+    doorAcClose();
+    loadDoor(d.itemid);
+  }
+
+  function doorAcClose(){
+    var l = \$('dnb-doorAc');
+    if (l) l.classList.remove('open');
+  }
+
+  // ── load an existing door ───────────────────────────────────────────────
+  function loadDoor(term){
+    var t = String(term || \$('dnb-number').value || '').trim();
+    if (!t){ setHint('dnb-numberHint', 'Enter a door number.', 'bad'); return; }
+    var seq = ++numReqSeq;
+    doorAcClose();
+    setHint('dnb-numberHint', 'Loading…', '');
+
+    function fail(msg){ if (seq === numReqSeq) setHint('dnb-numberHint', msg, 'bad'); }
+
+    var xhr = new XMLHttpRequest();
+    xhr.open('GET', baseUrl() + '&api=loaddoor&term=' + encodeURIComponent(t), true);
+    xhr.onload = function(){
+      if (seq !== numReqSeq) return;
+      try {
+        var s = xhr.responseText.indexOf('{'), e = xhr.responseText.lastIndexOf('}');
+        var r = JSON.parse(xhr.responseText.slice(s, e+1));
+        if (!r.ok){ fail(r.message || 'Not found.'); return; }
+        applyEditData(r);
+      } catch(err){
+        fail('Unexpected response — check the execution log.');
+      }
+    };
+    xhr.onerror = function(){ fail('Request failed.'); };
+    xhr.send();
+  }
+
+  // Mirrors the server's nextRevLetter() so the suggested name is visible
+  // before saving. Only a suggestion — rev letters here are not always
+  // sequential, so the field stays editable.
+  function suggestNextRevName(fam, partNum, currentRevName){
+    var m = String(currentRevName || '').trim().match(/\\bREV[\\s-]+([A-Z]+)\\s*\$/i);
+    var next = 'B';
+    if (m){
+      var cur = m[1].toUpperCase();
+      var last = cur.charCodeAt(cur.length - 1);
+      next = (last < 90) ? (cur.slice(0, -1) + String.fromCharCode(last + 1)) : (cur + 'A');
+    }
+    return partNum + REV_NAME_SEP[fam] + next;
+  }
+
+  function applyEditData(r){
+    mode = 'edit';
+    editData = r;
+
+    \$('dnb-series').value = r.series;
+    \$('dnb-number').value = r.number;
+    \$('dnb-number').classList.remove('bad');
+    setHint('dnb-numberHint', 'Loaded — edit below, or type another number to switch.', 'good');
+    \$('dnb-desc').value = r.description;
+    \$('dnb-class').value = r.classId || '';
+    \$('dnb-cut').value = r.cutDetails || '';
+    \$('dnb-screen').checked = !!r.hasScreen;
+    \$('dnb-newOnlyRow').style.display = 'none';
+    \$('dnb-doorNote').textContent = 'Editing ' + r.doorNumber + ' — ' +
+      ALL_FAMILIES.filter(function(f){ return r.families[f]; })
+        .map(function(f){ return FAMILY_LABEL[f].toLowerCase(); }).join(', ') + ' loaded.';
+
+    // Only show the cards for families this door actually has. A door with no
+    // screen should not present an empty screen grid that saves nothing.
+    for (var i=0;i<SUB_FAMILIES.length;i++){
+      var f = SUB_FAMILIES[i];
+      var card = \$('dnb-card-' + f);
+      if (card) card.style.display = r.families[f] ? '' : 'none';
+    }
+
+    for (var k=0;k<ALL_FAMILIES.length;k++){
+      var fam = ALL_FAMILIES[k];
+      var u = r.families[fam];
+      \$('dnb-compBody-' + fam).innerHTML = ''; rowCount[fam] = 0;
+      if (BUILDS_ROUTING[fam]){
+        \$('dnb-stepBody-' + fam).innerHTML = ''; stepCount[fam] = 0;
+      }
+      var revRow = \$('dnb-editRev-' + fam);
+      if (revRow) revRow.style.display = u ? '' : 'none';
+      if (!u) continue;
+
+      (u.components || []).forEach(function(c){
+        var i = addComponent(fam, false);
+        \$('dnb-comp-item-' + fam + i).value = c.itemNumber + '  —  ' + c.desc;
+        \$('dnb-comp-id-' + fam + i).value = c.itemId;
+        \$('dnb-comp-qty-' + fam + i).value = c.quantity;
+        \$('dnb-comp-src-' + fam + i).value = c.itemSource;
+        var row = \$('dnb-comp-' + fam + i);
+        if (row){ row.dataset.itemType = c.itemType || ''; row.dataset.srcManual = '1'; }
+      });
+      if (!(u.components || []).length) addComponent(fam, false);
+
+      if (BUILDS_ROUTING[fam]){
+        (u.steps || []).forEach(function(s){
+          var i = addStep(fam, false);
+          \$('dnb-step-seq-' + fam + i).value = s.sequence;
+          // The same operation name exists on more than one catalog entry
+          // (EXT CUT is both a frame and a core operation), so the cost
+          // template is what settles which entry a loaded step came from.
+          // The name-only hit is the fallback for steps whose template was
+          // never set or no longer resolves.
+          var opIdx = -1, nameHit = -1;
+          var cat = OPERATIONS[fam] || [];
+          for (var q=0;q<cat.length;q++){
+            if (norm(cat[q].op) !== norm(s.operationName)) continue;
+            if (nameHit === -1) nameHit = q;
+            if (s.costTemplateId &&
+                String(matchByName(COST_TEMPLATES, cat[q].ct)) === String(s.costTemplateId)){
+              opIdx = q; break;
+            }
+          }
+          if (opIdx === -1) opIdx = nameHit;
+          if (opIdx >= 0){
+            \$('dnb-step-op-' + fam + i).value = opIdx;
+          } else {
+            \$('dnb-step-op-' + fam + i).value = 'custom';
+            onOpChange(fam, i);
+            \$('dnb-step-optxt-' + fam + i).value = s.operationName;
+          }
+          \$('dnb-step-wc-' + fam + i).value = s.workCenterId || '';
+          \$('dnb-step-ct-' + fam + i).value = s.costTemplateId || '';
+          \$('dnb-step-run-' + fam + i).value = s.runRate;
+          \$('dnb-step-setup-' + fam + i).value = s.setupTime;
+        });
+        if (!(u.steps || []).length) addStep(fam, false);
+      }
+
+      \$('dnb-curRevName-' + fam).value = u.revName || '';
+      \$('dnb-newRevName-' + fam).value = u.revName
+        ? suggestNextRevName(fam, u.partNumber, u.revName) : '';
+    }
+
+    \$('dnb-submit').textContent = 'Update fields';
+    \$('dnb-submit').onclick = submitUpdate;
+    \$('dnb-newRevBtn').style.display = '';
+
+    var warn = (r.warnings && r.warnings.length)
+      ? ' \\u00B7 ' + r.warnings.join(' \\u00B7 ') : '';
+    \$('dnb-editBanner').textContent =
+      'Update Fields saves item fields, routing and the CURRENT revisions in place. ' +
+      'Save As New BOM Revs closes each current revision and opens a new one dated yesterday. ' +
+      'Routing is not versioned by revision in this account, so it always saves in place.' + warn;
+    \$('dnb-editBanner').classList.add('open');
+
+    refreshNumbers();
+    updatePreview();
+  }
+
+  // The number of a loaded door was changed to one that does NOT exist, so
+  // this is a new door now. The grids are deliberately LEFT ALONE — loading a
+  // door and retyping the number is how you clone one.
+  function exitEditMode(keepNumber){
+    mode = 'new';
+    editData = null;
+    \$('dnb-editBanner').classList.remove('open');
+    \$('dnb-doorNote').textContent = DOOR_NOTE_NEW;
+    \$('dnb-newOnlyRow').style.display = '';
+    \$('dnb-submit').textContent = 'Create door';
+    \$('dnb-submit').onclick = submit;
+    \$('dnb-newRevBtn').style.display = 'none';
+    for (var i=0;i<ALL_FAMILIES.length;i++){
+      var revRow = \$('dnb-editRev-' + ALL_FAMILIES[i]);
+      if (revRow) revRow.style.display = 'none';
+    }
+    toggleScreen();
+    if (keepNumber) \$('dnb-number').value = keepNumber;
+    refreshNumbers();
+    updatePreview();
+  }
+
+  function toggleScreen(){
+    var on = \$('dnb-screen').checked;
+    var card = \$('dnb-card-S');
+    if (card) card.style.display = on ? '' : 'none';
+    if (on && !rowCount.S){
+      seedFamily('S');
+    }
+    refreshNumbers();
+    updatePreview();
+  }
+
+  // ── components ──────────────────────────────────────────────────────────
+  function addComponent(fam, focusNew){
+    var i = rowCount[fam]++;
+    var key = fam + i;
+    var tr = document.createElement('tr');
+    tr.id = 'dnb-comp-' + key;
+    tr.innerHTML =
+      '<td><div class="ac-wrap">' +
+        '<input id="dnb-comp-item-' + key + '" class="tabstop" placeholder="Search part…" autocomplete="off" ' +
+          'oninput="GNYDNB.acInput(\\'' + key + '\\')" onkeydown="GNYDNB.acKey(event,\\'' + key + '\\')">' +
+        '<input type="hidden" id="dnb-comp-id-' + key + '">' +
+        '<div class="ac-list" id="dnb-ac-' + key + '"></div>' +
+      '</div></td>' +
+      '<td><input class="num tabstop" id="dnb-comp-qty-' + key + '" value="1" onfocus="this.select()"></td>' +
+      '<td><select id="dnb-comp-src-' + key + '" tabindex="-1" ' +
+        'onchange="GNYDNB.markSourceManual(\\'' + key + '\\')">' +
+        optionsHtml(ITEM_SOURCES,'v','l',null) + '</select></td>' +
+      '<td><button type="button" class="btn-x" tabindex="-1" ' +
+        'onclick="GNYDNB.removeRow(\\'dnb-comp-' + key + '\\')" ' +
+        'title="Remove component" aria-label="Remove component">&times;</button></td>';
+    \$('dnb-compBody-' + fam).appendChild(tr);
+
+    if (focusNew){
+      var el = \$('dnb-comp-item-' + key);
+      if (el) el.focus();
+    }
+    return i;
+  }
+
+  function removeRow(id){
+    var el = \$(id);
+    if (el) el.parentNode.removeChild(el);
+  }
+
+  // ── component autocomplete ──────────────────────────────────────────────
+  function acInput(key){
+    clearTimeout(acTimers[key]);
+    \$('dnb-comp-id-' + key).value = '';
+    var val = \$('dnb-comp-item-' + key).value.trim();
+    if (val.length < SEARCH_MIN_CHARS){ closeAc(key); return; }
+
+    var ck = val.toUpperCase();
+    if (acQueryCache[ck]){          // instant — no round trip
+      acData[key] = acQueryCache[ck];
+      acRender(key);
+      return;
+    }
+    acTimers[key] = setTimeout(function(){ acFetch(key, val); }, 200);
+  }
+
+  function acFetch(key, term){
+    var ck = term.toUpperCase();
+    var xhr = new XMLHttpRequest();
+    xhr.open('GET', baseUrl() + '&api=items&term=' + encodeURIComponent(term), true);
+    xhr.onload = function(){
+      try {
+        var t = xhr.responseText, s = t.indexOf('['), e = t.lastIndexOf(']');
+        if (s === -1){ closeAc(key); return; }
+        acData[key] = JSON.parse(t.slice(s, e+1));
+        acQueryCache[ck] = acData[key];
+        acRender(key);
+      } catch(err){ closeAc(key); }
+    };
+    xhr.onerror = function(){ closeAc(key); };
+    xhr.send();
+  }
+
+  function acRender(key){
+    var list = \$('dnb-ac-' + key), d = acData[key] || [];
+    if (!d.length){ closeAc(key); return; }
+    var h = '';
+    for (var k=0;k<d.length;k++){
+      h += '<div class="ac-item" onclick="GNYDNB.acPick(\\'' + key + '\\',' + k + ')">' +
+           '<span class="ac-id">' + esc(d[k].itemid) + '</span>' +
+           '<span class="ac-desc">' + esc(d[k].desc) + '</span></div>';
+    }
+    list.innerHTML = h;
+    list.classList.add('open');
+    acActive[key] = -1;
+  }
+
+  function acKey(e, key){
+    var list = \$('dnb-ac-' + key);
+    if (!list.classList.contains('open')) return;
+    var items = list.querySelectorAll('.ac-item');
+    // Reading acActive[key] with || -1 would treat index 0 as falsy, so
+    // ArrowDown snaps back to the first row on every press after the first.
+    // Read the index explicitly instead.
+    var cur = (typeof acActive[key] === 'number') ? acActive[key] : -1;
+    if (e.key === 'ArrowDown'){
+      acActive[key] = Math.min(cur+1, items.length-1); acHi(key, items); e.preventDefault();
+    } else if (e.key === 'ArrowUp'){
+      acActive[key] = Math.max(cur-1, 0); acHi(key, items); e.preventDefault();
+    } else if (e.key === 'Enter'){
+      if (acActive[key] >= 0){ acPick(key, acActive[key]); e.preventDefault(); }
+    } else if (e.key === 'Escape'){
+      closeAc(key);
+    }
+  }
+
+  function acHi(key, items){
+    for (var k=0;k<items.length;k++) items[k].classList.toggle('active', k === acActive[key]);
+    if (acActive[key] >= 0) items[acActive[key]].scrollIntoView({ block:'nearest' });
+  }
+
+  function acPick(key, k){
+    var d = (acData[key]||[])[k];
+    if (!d) return;
+    \$('dnb-comp-item-' + key).value = d.itemid + '  —  ' + d.desc;
+    \$('dnb-comp-id-' + key).value = d.id;
+
+    var row = \$('dnb-comp-' + key);
+    if (row) row.dataset.itemType = d.type || '';
+
+    if (!row || row.dataset.srcManual !== '1'){
+      var sel = \$('dnb-comp-src-' + key);
+      sel.value = SOURCE_BY_ITEMTYPE[d.type] || SOURCE_FALLBACK;
+      sel.title = 'Set from item type: ' + (d.type || 'unknown');
+    }
+
+    closeAc(key);
+    // Land on quantity — the only thing left to type on this row.
+    var qty = \$('dnb-comp-qty-' + key);
+    if (qty){ qty.focus(); qty.select(); }
+  }
+
+  function markSourceManual(key){
+    var row = \$('dnb-comp-' + key);
+    if (row) row.dataset.srcManual = '1';
+    var sel = \$('dnb-comp-src-' + key);
+    if (sel) sel.title = 'Set manually';
+  }
+
+  function closeAc(key){
+    var l = \$('dnb-ac-' + key);
+    if (l) l.classList.remove('open');
+  }
+
+  function closeAllAc(){
+    var l = root.querySelectorAll('.ac-list');
+    for (var i=0;i<l.length;i++) l[i].classList.remove('open');
+  }
+
+  // ── routing steps ───────────────────────────────────────────────────────
+  // Matches a catalog name against what the account actually has: exact
+  // first, then starts-with, then contains, all whitespace-normalised. That
+  // normalisation is what makes "DR  Core Lamination" (double space, and yes
+  // that is its real name) resolve.
+  function matchByName(list, wanted){
+    if (!wanted) return '';
+    var w = norm(wanted), i, n;
+    for (i=0;i<list.length;i++){ if (norm(list[i].name) === w) return list[i].id; }
+    for (i=0;i<list.length;i++){ if (norm(list[i].name).indexOf(w) === 0) return list[i].id; }
+    for (i=0;i<list.length;i++){ if (norm(list[i].name).indexOf(w) !== -1) return list[i].id; }
+    return '';
+  }
+
+  function opOptionsHtml(fam){
+    var cat = OPERATIONS[fam] || [];
+    var h = '<option value="">— select —</option>';
+    for (var i=0;i<cat.length;i++){
+      h += '<option value="' + i + '">' + esc(cat[i].op) + '</option>';
+    }
+    h += '<option value="custom">— other —</option>';
+    return h;
+  }
+
+  // Fills sequence, work center, cost template, run rate and setup from the
+  // family's own catalog — which is the whole point of keying operations by
+  // family. EXT CUT on a core costs differently from EXT CUT on a frame.
+  function onOpChange(fam, i){
+    var key = fam + i;
+    var sel = \$('dnb-step-op-' + key);
+    var txt = \$('dnb-step-optxt-' + key);
+    var val = sel.value;
+
+    if (val === 'custom'){
+      sel.style.display = 'none';
+      txt.style.display = '';
+      txt.value = '';
+      txt.focus();
+      return;
+    }
+
+    txt.style.display = 'none';
+    txt.value = '';
+    if (val === '') return;
+
+    var o = (OPERATIONS[fam] || [])[parseInt(val, 10)];
+    if (!o) return;
+
+    \$('dnb-step-seq-' + key).value = o.seq;
+    \$('dnb-step-run-' + key).value = o.run;
+    \$('dnb-step-setup-' + key).value = o.setup;
+
+    var wcId = matchByName(WORK_CENTERS, o.wc);
+    var ctId = matchByName(COST_TEMPLATES, o.ct);
+    \$('dnb-step-wc-' + key).value = wcId;
+    \$('dnb-step-ct-' + key).value = ctId;
+
+    // Flag anything the account couldn't resolve rather than saving it blank.
+    \$('dnb-step-wc-' + key).classList.toggle('bad', !wcId);
+    \$('dnb-step-ct-' + key).classList.toggle('bad', !ctId);
+    \$('dnb-step-wc-' + key).title = wcId ? '' : 'No work center named "' + o.wc + '" — pick one.';
+    \$('dnb-step-ct-' + key).title = ctId ? '' : 'No cost template named "' + o.ct + '" — pick one.';
+  }
+
+  function opRevert(fam, i){
+    var key = fam + i;
+    var sel = \$('dnb-step-op-' + key), txt = \$('dnb-step-optxt-' + key);
+    txt.style.display = 'none';
+    txt.value = '';
+    sel.style.display = '';
+    sel.value = '';
+  }
+
+  function stepOperationName(fam, i){
+    var key = fam + i;
+    var sel = \$('dnb-step-op-' + key), txt = \$('dnb-step-optxt-' + key);
+    if (sel.value === 'custom') return txt.value.trim().toUpperCase();
+    if (sel.value === '') return '';
+    var o = (OPERATIONS[fam] || [])[parseInt(sel.value, 10)];
+    return o ? o.op : '';
+  }
+
+  function addStep(fam, focusNew){
+    var i = stepCount[fam]++;
+    var key = fam + i;
+    var tr = document.createElement('tr');
+    tr.id = 'dnb-step-' + key;
+    tr.innerHTML =
+      '<td><input class="num" id="dnb-step-seq-' + key + '" value="" tabindex="-1"></td>' +
+      '<td>' +
+        '<select id="dnb-step-op-' + key + '" class="tabstop" onchange="GNYDNB.onOpChange(\\'' + fam + '\\',' + i + ')">' +
+          opOptionsHtml(fam) + '</select>' +
+        '<input id="dnb-step-optxt-' + key + '" style="display:none" placeholder="Operation name" ' +
+          'autocomplete="off" onblur="if(!this.value.trim())GNYDNB.opRevert(\\'' + fam + '\\',' + i + ')">' +
+      '</td>' +
+      '<td><select id="dnb-step-wc-' + key + '" tabindex="-1">' +
+        optionsHtml(WORK_CENTERS,'id','name','— none —') + '</select></td>' +
+      '<td><select id="dnb-step-ct-' + key + '" tabindex="-1">' +
+        optionsHtml(COST_TEMPLATES,'id','name','— none —') + '</select></td>' +
+      '<td><input class="num" id="dnb-step-run-' + key + '" value="5" tabindex="-1"></td>' +
+      '<td><input class="num" id="dnb-step-setup-' + key + '" value="0" tabindex="-1"></td>' +
+      '<td><button type="button" class="btn-x" tabindex="-1" ' +
+        'onclick="GNYDNB.removeRow(\\'dnb-step-' + key + '\\')" ' +
+        'title="Remove step" aria-label="Remove step">&times;</button></td>';
+    \$('dnb-stepBody-' + fam).appendChild(tr);
+
+    if (focusNew){
+      var el = \$('dnb-step-op-' + key);
+      if (el) el.focus();
+    }
+    return i;
+  }
+
+  // Opens a family with its blank component rows and its default routing —
+  // the shape the shop actually runs, so most doors need no routing edits at
+  // all. Rows stay fully editable.
+  function seedFamily(fam){
+    \$('dnb-compBody-' + fam).innerHTML = ''; rowCount[fam] = 0;
+    var n = DEFAULT_COMPONENT_ROWS[fam] || 1;
+    for (var i=0;i<n;i++) addComponent(fam, false);
+
+    if (!BUILDS_ROUTING[fam]) return;
+    \$('dnb-stepBody-' + fam).innerHTML = ''; stepCount[fam] = 0;
+    var wanted = DEFAULT_STEPS[fam] || [];
+    var cat = OPERATIONS[fam] || [];
+    for (var k=0;k<wanted.length;k++){
+      var idx = -1;
+      for (var q=0;q<cat.length;q++){ if (cat[q].op === wanted[k]){ idx = q; break; } }
+      var row = addStep(fam, false);
+      if (idx >= 0){
+        \$('dnb-step-op-' + fam + row).value = idx;
+        onOpChange(fam, row);
+      }
+    }
+    if (!wanted.length) addStep(fam, false);
+  }
+
+  // ── preview ─────────────────────────────────────────────────────────────
+  function updatePreview(){
+    var box = \$('dnb-preview-box');
+    var line = \$('dnb-preview');
+
+    if (mode === 'edit' && editData){
+      var fams = ALL_FAMILIES.filter(function(f){ return editData.families[f]; });
+      box.innerHTML = fams.map(function(f){
+        var u = editData.families[f];
+        return '<b>' + esc(u.partNumber) + '</b> &middot; ' + esc(u.revName || 'no revision') +
+               (u.routingId ? ' &middot; routing' : '');
+      }).join('<br>');
+      line.innerHTML = 'Editing <b>' + esc(editData.doorNumber) + '</b>';
+      return;
+    }
+
+    var s = \$('dnb-series').value, n = \$('dnb-number').value.trim();
+    if (!s || !n){
+      box.innerHTML = '<span class="dim">Pick a series and a number.</span>';
+      line.innerHTML = '';
+      return;
+    }
+
+    var subs = activeFamilies();
+    var all = subs.concat(['DR']);
+    var records = 0, h = '';
+    for (var i=0;i<all.length;i++){
+      var f = all[i], pn = partNumberFor(f);
+      records += 3 + (BUILDS_ROUTING[f] ? 1 : 0);
+      h += '<b>' + esc(pn) + '</b> &middot; BOM &middot; ' + esc(\$('dnb-rev').value) +
+           (BUILDS_ROUTING[f] ? ' &middot; routing' : ' &middot; <span class="dim">no routing</span>') +
+           '<br>';
+    }
+    box.innerHTML = h;
+    line.innerHTML = records + ' records across ' + all.length + ' items';
+  }
+
+  // ── payload ─────────────────────────────────────────────────────────────
+  // Collects one family's grids. Returns null (after showing the error) if
+  // something typed never resolved to a real item.
+  function collectFamily(fam){
+    var out = { components: [], steps: [] };
+    var i;
+    for (i=0;i<rowCount[fam];i++){
+      var key = fam + i;
+      if (!\$('dnb-comp-' + key)) continue;
+      var itemId = \$('dnb-comp-id-' + key).value;
+      var typed = \$('dnb-comp-item-' + key).value.trim();
+      if (!itemId){
+        if (typed){
+          showError(FAMILY_LABEL[fam] + ': pick "' + typed +
+                    '" from the search list so it resolves to a real part.');
+          return null;
+        }
+        continue;
+      }
+      out.components.push({
+        itemId: itemId,
+        quantity: \$('dnb-comp-qty-' + key).value,
+        itemSource: \$('dnb-comp-src-' + key).value
+      });
+    }
+
+    if (BUILDS_ROUTING[fam]){
+      for (i=0;i<stepCount[fam];i++){
+        var sk = fam + i;
+        if (!\$('dnb-step-' + sk)) continue;
+        var op = stepOperationName(fam, i);
+        if (!op) continue;
+        var seqVal = \$('dnb-step-seq-' + sk).value.trim();
+        if (!seqVal){
+          showError(FAMILY_LABEL[fam] + ': ' + op + ' has no sequence number.');
+          return null;
+        }
+        out.steps.push({
+          sequence: seqVal,
+          operationName: op,
+          workCenterId: \$('dnb-step-wc-' + sk).value,
+          costTemplateId: \$('dnb-step-ct-' + sk).value,
+          runRate: \$('dnb-step-run-' + sk).value,
+          setupTime: \$('dnb-step-setup-' + sk).value
+        });
+      }
+    }
+    return out;
+  }
+
+  function postJson(payload, onDone){
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', baseUrl(), true);
+    xhr.setRequestHeader('Content-Type', 'application/json');
+    xhr.onload = function(){
+      try {
+        var t = xhr.responseText, s = t.indexOf('{'), e = t.lastIndexOf('}');
+        onDone(JSON.parse(t.slice(s, e+1)));
+      } catch(err){
+        onDone({ ok: false, message: 'Unexpected response from NetSuite. Check the script execution log.' });
+      }
+    };
+    xhr.onerror = function(){
+      onDone({ ok: false, message: 'Request failed. Check your connection and the script execution log.' });
+    };
+    xhr.send(JSON.stringify(payload));
+  }
+
+  // ── submit: new door ────────────────────────────────────────────────────
+  function submit(){
+    var series = \$('dnb-series').value;
+    var number = \$('dnb-number').value.trim();
+    var desc = \$('dnb-desc').value.trim();
+    if (!series){ showError('Pick a door series.'); return; }
+    if (!number){ showError('Enter a door number.'); return; }
+    if (!desc){ showError('Enter a description.'); return; }
+
+    var payload = {
+      action: 'build',
+      series: series,
+      number: number,
+      description: desc,
+      classId: \$('dnb-class').value,
+      cutDetails: \$('dnb-cut').value,
+      includeScreen: \$('dnb-screen').checked,
+      autoIssue: \$('dnb-autoIssue').checked,
+      revLetter: \$('dnb-rev').value,
+      effectiveDate: \$('dnb-date').value.trim(),
+      families: {}
+    };
+
+    var fams = activeFamilies().concat(['DR']);
+    for (var i=0;i<fams.length;i++){
+      var got = collectFamily(fams[i]);
+      if (!got) return;
+      payload.families[fams[i]] = got;
+    }
+
+    var btn = \$('dnb-submit');
+    btn.disabled = true;
+    btn.textContent = 'Creating…';
+
+    postJson(payload, function(r){
+      btn.disabled = false;
+      btn.textContent = 'Create door';
+      if (r.ok) showSuccess(r); else showError(r.message, r.rolledBack);
+    });
+  }
+
+  // ── submit: edit mode ───────────────────────────────────────────────────
+  function buildEditPayload(action){
+    if (!editData) return null;
+    var desc = \$('dnb-desc').value.trim();
+    if (!desc){ showError('Enter a description.'); return null; }
+
+    var payload = {
+      action: action,
+      doorNumber: editData.doorNumber,
+      description: desc,
+      classId: \$('dnb-class').value,
+      cutDetails: \$('dnb-cut').value,
+      autoIssue: \$('dnb-autoIssue').checked,
+      families: {}
+    };
+
+    for (var i=0;i<ALL_FAMILIES.length;i++){
+      var f = ALL_FAMILIES[i];
+      var u = editData.families[f];
+      if (!u) continue;
+      var got = collectFamily(f);
+      if (!got) return null;
+      payload.families[f] = {
+        partNumber: u.partNumber,
+        itemId: u.itemId,
+        bomId: u.bomId,
+        revId: u.revId,
+        revName: u.revName,
+        routingId: u.routingId,
+        newRevName: \$('dnb-newRevName-' + f).value.trim(),
+        // The door's sub-assembly lines are sent back as loaded, never from
+        // the grid, so they cannot be lost by editing hardware rows.
+        subLines: u.subLines || [],
+        components: got.components,
+        steps: got.steps
+      };
+    }
+    return payload;
+  }
+
+  function submitUpdate(){
+    var payload = buildEditPayload('updateFields');
+    if (!payload) return;
+    var btn = \$('dnb-submit'), revBtn = \$('dnb-newRevBtn');
+    btn.disabled = true; btn.textContent = 'Saving…'; revBtn.disabled = true;
+    postJson(payload, function(r){
+      btn.disabled = false; btn.textContent = 'Update fields'; revBtn.disabled = false;
+      if (r.ok) showEditSuccess(r); else showError(r.message, null, r.alreadySaved);
+    });
+  }
+
+  function submitNewRev(){
+    var payload = buildEditPayload('newBomRev');
+    if (!payload) return;
+    for (var f in payload.families){
+      if (!payload.families[f].newRevName){
+        showError(FAMILY_LABEL[f] + ' needs a name for its new revision.');
+        \$('dnb-newRevName-' + f).focus();
+        return;
+      }
+    }
+    var btn = \$('dnb-submit'), revBtn = \$('dnb-newRevBtn');
+    btn.disabled = true; revBtn.disabled = true; revBtn.textContent = 'Saving…';
+    postJson(payload, function(r){
+      btn.disabled = false; revBtn.disabled = false; revBtn.textContent = 'Save as new BOM revs';
+      if (r.ok) showEditSuccess(r); else showError(r.message, null, r.alreadySaved);
+    });
+  }
+
+  // ── results ─────────────────────────────────────────────────────────────
+  function showSuccess(r){
+    addRecent(r);
+
+    var box = \$('dnb-result');
+    var h = '<h3>' + esc(r.message) +
+      (r.ms ? ' <span class="dim" style="font-weight:400">' + (r.ms/1000).toFixed(1) + 's</span>' : '') +
+      '</h3><ul>';
+    for (var i=0;i<ALL_FAMILIES.length;i++){
+      var f = ALL_FAMILIES[i], u = r.families[f];
+      if (!u) continue;
+      h += '<li><a href="/app/common/item/item.nl?id=' + u.item.id + '" target="_blank">' +
+           esc(u.name) + '</a> &middot; ' +
+           '<a href="/app/manufacturing/billofmaterials.nl?id=' + u.bom.id + '" target="_blank">BOM</a> &middot; ' +
+           '<a href="/app/manufacturing/billofmaterialsrevision.nl?id=' + u.revision.id +
+           '" target="_blank">' + esc(u.revision.name) + '</a> (' + u.revision.lines + ' line(s))' +
+           (u.routing
+             ? ' &middot; <a href="/app/accounting/manufacturing/mfgrouting.nl?id=' + u.routing.id +
+               '" target="_blank">routing</a> (' + u.routing.steps + ' step(s))'
+             : '') +
+           '</li>';
+    }
+    h += '</ul>';
+    if (r.timing){
+      h += '<div class="dim" style="font-family:var(--dnb-mono);font-size:10px;margin-top:4px">' +
+           esc(r.timing) + '</div>';
+    }
+    if (!AUTO_RESET){
+      h += '<div style="margin-top:10px"><button type="button" onclick="GNYDNB.clearForm()">' +
+           'Build another door</button></div>';
+    }
+    box.innerHTML = h;
+    box.className = 'result ok open';
+
+    if (AUTO_RESET) clearForm();
+    box.scrollIntoView({ block:'nearest' });
+  }
+
+  function showEditSuccess(r){
+    // Runs FIRST — editData and the description field are both wiped by the
+    // reset at the end of this function.
+    addRecentEdit(r);
+
+    var box = \$('dnb-result');
+    var h = '<h3>' + esc(r.message) +
+      (r.ms ? ' <span class="dim" style="font-weight:400">' + (r.ms/1000).toFixed(1) + 's</span>' : '') +
+      '</h3><ul>';
+    for (var i=0;i<ALL_FAMILIES.length;i++){
+      var f = ALL_FAMILIES[i], u = r.families[f];
+      if (!u) continue;
+      h += '<li>' + esc(u.partNumber);
+      if (u.closedRevision){
+        h += ' &middot; closed ' + esc(u.closedRevision.name) +
+             ' (end ' + esc(new Date(u.closedRevision.effectiveEnd).toLocaleDateString()) + ')';
+      }
+      if (u.revision && !u.revision.skipped){
+        h += ' &middot; ' + (u.revision.replaced ? 'opened ' : 'updated ') + esc(u.revision.name) +
+             ' (' + u.revision.lines + ' line(s))';
+        if (u.revision.note) h += ' <span class="dim">' + esc(u.revision.note) + '</span>';
+      }
+      if (u.routing){
+        h += ' &middot; routing ' + u.routing.steps + ' step(s)';
+        if (u.routing.remapped && u.routing.remapped.length){
+          var moves = u.routing.remapped.map(function(m){
+            return m.revision + ' line ' + m.line + ': op ' + m.from + ' \\u2192 ' + m.to;
+          });
+          h += ' <span class="dim">— components repointed off deleted steps: ' +
+               esc(moves.join(', ')) + '</span>';
+        }
+      }
+      h += '</li>';
+    }
+    h += '</ul>';
+    box.innerHTML = h;
+    box.className = 'result ok open';
+    box.scrollIntoView({ block:'nearest' });
+
+    // Reset to an empty form so the next door can be typed straight away. The
+    // result box above stays on screen as the record of what saved.
+    exitEditMode('');
+    clearForm();
+  }
+
+  function showError(msg, rolledBack, alreadySaved){
+    var box = \$('dnb-result');
+    var partial = alreadySaved && alreadySaved.length;
+    var h = '<h3>' + (partial ? 'Partly saved' : 'Nothing was saved') + '</h3><ul><li>' + esc(msg) + '</li>';
+    if (partial){
+      h += '<li class="dim" style="margin-top:6px">Already saved before this failed: ' +
+           esc(alreadySaved.join(', ')) + '.</li>';
+    }
+    if (rolledBack && rolledBack.length){
+      h += '<li class="dim" style="margin-top:6px">Rolled back: ' + esc(rolledBack.join(', ')) + '</li>';
+    }
+    h += '</ul>';
+    box.innerHTML = h;
+    box.className = 'result err open';
+    box.scrollIntoView({ block:'nearest' });
+  }
+
+  // ── recent activity ─────────────────────────────────────────────────────
+  function loadRecent(){
+    try {
+      var raw = window.sessionStorage.getItem(RECENT_KEY);
+      return raw ? JSON.parse(raw) : [];
+    } catch(e){ return []; }
+  }
+
+  function saveRecent(list){
+    try { window.sessionStorage.setItem(RECENT_KEY, JSON.stringify(list)); } catch(e){}
+  }
+
+  function stamp(){
+    var d = new Date();
+    var hh = d.getHours(), mm = String(d.getMinutes()).padStart(2,'0');
+    var ampm = hh >= 12 ? 'pm' : 'am';
+    hh = hh % 12; if (hh === 0) hh = 12;
+    return hh + ':' + mm + ampm;
+  }
+
+  function addRecent(r){
+    var list = loadRecent();
+    var dr = r.families.DR;
+    var parts = [];
+    for (var i=0;i<ALL_FAMILIES.length;i++){
+      var f = ALL_FAMILIES[i], u = r.families[f];
+      if (!u || f === 'DR') continue;
+      parts.push({ label: f, itemId: u.item.id, part: u.name });
+    }
+    list.unshift({
+      kind: 'built',
+      part: dr.name,
+      itemId: dr.item.id,
+      desc: r.description || '',
+      bomId: dr.bom.id,
+      revId: dr.revision.id,
+      lines: dr.revision.lines,
+      subs: parts,
+      time: stamp()
+    });
+    if (list.length > RECENT_LIMIT) list = list.slice(0, RECENT_LIMIT);
+    saveRecent(list);
+    renderRecent(true);
+  }
+
+  // Edit saves land in the same rail as builds, so the session's whole trail
+  // of work is in one place with the same links out to the records.
+  function addRecentEdit(r){
+    if (!editData) return;
+    var list = loadRecent();
+    var dr = r.families.DR || {};
+    var rev = dr.revision || {};
+    var parts = [];
+    for (var i=0;i<ALL_FAMILIES.length;i++){
+      var f = ALL_FAMILIES[i], u = editData.families[f];
+      if (!u || f === 'DR') continue;
+      parts.push({ label: f, itemId: u.itemId, part: u.partNumber });
+    }
+    list.unshift({
+      // A new revision is a different thing from an in-place field update —
+      // "NEW REV" vs "UPDATED" is the distinction worth seeing at a glance.
+      kind: rev.replaced ? 'revised' : 'updated',
+      part: editData.doorNumber,
+      itemId: editData.families.DR.itemId,
+      desc: r.description || '',
+      bomId: editData.families.DR.bomId,
+      revId: rev.id || editData.families.DR.revId,
+      lines: rev.lines || 0,
+      subs: parts,
+      time: stamp()
+    });
+    if (list.length > RECENT_LIMIT) list = list.slice(0, RECENT_LIMIT);
+    saveRecent(list);
+    renderRecent(true);
+  }
+
+  function renderRecent(markFirst){
+    var list = loadRecent();
+    var body = \$('dnb-recentBody');
+    var count = \$('dnb-recentCount');
+    if (!body) return;
+
+    count.textContent = list.length ? list.length + ' this session' : '';
+
+    if (!list.length){
+      body.innerHTML = '<div class="recent-empty">Nothing built or edited yet.</div>';
+      return;
+    }
+
+    var h = '';
+    for (var i=0;i<list.length;i++){
+      var r = list[i];
+      var kind = r.kind || 'built';
+      var tag = kind === 'revised' ? 'NEW REV' : (kind === 'updated' ? 'UPDATED' : 'BUILT');
+      h += '<div class="recent' + (kind === 'built' ? '' : ' edited') +
+             (markFirst && i === 0 ? ' fresh' : '') + '">' +
+             '<div class="recent-top">' +
+               '<span class="recent-part"><a href="/app/common/item/item.nl?id=' + r.itemId +
+                 '" target="_blank">' + esc(r.part) + '</a></span>' +
+               '<span class="recent-meta">' +
+                 '<span class="recent-tag t-' + kind + '">' + tag + '</span>' +
+                 '<span class="recent-time">' + esc(r.time) + '</span>' +
+               '</span>' +
+             '</div>' +
+             (r.desc ? '<div class="recent-desc" title="' + esc(r.desc) + '">' + esc(r.desc) + '</div>' : '') +
+             '<div class="recent-links">' +
+               '<a href="/app/manufacturing/billofmaterials.nl?id=' + r.bomId + '" target="_blank">BOM</a>' +
+               '<a href="/app/manufacturing/billofmaterialsrevision.nl?id=' + r.revId +
+                 '" target="_blank">REV &middot; ' + r.lines + '</a>' +
+               (r.subs || []).map(function(s){
+                 return '<a href="/app/common/item/item.nl?id=' + s.itemId +
+                        '" target="_blank" title="' + esc(s.part) + '">' + esc(s.label) + '</a>';
+               }).join('') +
+             '</div>' +
+           '</div>';
+    }
+    h += '<button type="button" class="recent-clear" tabindex="-1" onclick="GNYDNB.clearRecent()">Clear list</button>';
+    body.innerHTML = h;
+  }
+
+  function clearRecent(){
+    saveRecent([]);
+    renderRecent(false);
+  }
+
+  // ── reset ───────────────────────────────────────────────────────────────
+  function setDefaultDate(){
+    var d = new Date();
+    d.setDate(d.getDate() + DATE_OFFSET);
+    \$('dnb-date').value = (d.getMonth()+1) + '/' + d.getDate() + '/' + d.getFullYear();
+  }
+
+  // Re-fetches the next free number instead of just incrementing the last
+  // one. Someone else may have built a door in the meantime, and a stale
+  // suggestion turns into a confusing duplicate failure at submit time.
+  function fetchNextNumber(){
+    var xhr = new XMLHttpRequest();
+    xhr.open('GET', baseUrl() + '&api=nextnumber', true);
+    xhr.onload = function(){
+      try {
+        var t = xhr.responseText, s = t.indexOf('{'), e = t.lastIndexOf('}');
+        var r = JSON.parse(t.slice(s, e+1));
+        if (r.number && mode === 'new' && !\$('dnb-number').value){
+          \$('dnb-number').value = r.number;
+          setHint('dnb-numberHint', 'Next free number', 'good');
+          refreshNumbers();
+          updatePreview();
+        }
+      } catch(err){}
+    };
+    xhr.send();
+  }
+
+  // Clears in place so the next door can be typed straight away. Deliberately
+  // not a page reload — that would wipe the recent list.
+  function clearForm(){
+    mode = 'new';
+    editData = null;
+    numReqSeq++;   // abandon any checkdoor/loaddoor still in flight
+    \$('dnb-editBanner').classList.remove('open');
+    \$('dnb-doorNote').textContent = DOOR_NOTE_NEW;
+    \$('dnb-newOnlyRow').style.display = '';
+
+    \$('dnb-number').value = '';
+    \$('dnb-number').classList.remove('bad');
+    setHint('dnb-numberHint', '', '');
+    doorAcClose();
+    \$('dnb-desc').value = '';
+    \$('dnb-cut').value = '';
+    \$('dnb-rev').value = 'A';
+    \$('dnb-autoIssue').checked = AUTO_ISSUE_DEFAULT;
+    \$('dnb-screen').checked = INCLUDE_SCREEN_DEFAULT;
+    classUserSet = false;
+    onSeriesChange();
+    setDefaultDate();
+
+    acData = {}; acActive = {};
+    for (var k in acTimers) clearTimeout(acTimers[k]);
+    acTimers = {};
+
+    for (var i=0;i<ALL_FAMILIES.length;i++){
+      var f = ALL_FAMILIES[i];
+      var revRow = \$('dnb-editRev-' + f);
+      if (revRow) revRow.style.display = 'none';
+      var card = \$('dnb-card-' + f);
+      if (card && f === 'S') card.style.display = INCLUDE_SCREEN_DEFAULT ? '' : 'none';
+      else if (card) card.style.display = '';
+    }
+
+    seedFamily('DR');
+    seedFamily('F');
+    seedFamily('C');
+    if (INCLUDE_SCREEN_DEFAULT) seedFamily('S');
+    else { \$('dnb-compBody-S').innerHTML = ''; rowCount.S = 0;
+           \$('dnb-stepBody-S').innerHTML = ''; stepCount.S = 0; }
+
+    \$('dnb-submit').textContent = 'Create door';
+    \$('dnb-submit').onclick = submit;
+    \$('dnb-newRevBtn').style.display = 'none';
+
+    fetchNextNumber();
+    refreshNumbers();
+    updatePreview();
+    \$('dnb-series').focus();
+  }
+
+  function reset(){ window.location.href = baseUrl(); }
+
+  // ── init ────────────────────────────────────────────────────────────────
+  function init(){
+    root = \$('${WRAP}');
+    if (!root) return;
+
+    var letters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', rh = '';
+    for (var i=0;i<letters.length;i++){
+      rh += '<option value="' + letters[i] + '">REV ' + letters[i] + '</option>';
+    }
+    \$('dnb-rev').innerHTML = rh;
+    \$('dnb-class').innerHTML = optionsHtml(CLASSES,'id','name','— none —');
+    \$('dnb-autoIssue').checked = AUTO_ISSUE_DEFAULT;
+    \$('dnb-screen').checked = INCLUDE_SCREEN_DEFAULT;
+    \$('dnb-submit').onclick = submit;
+    setDefaultDate();
+
+    seedFamily('DR');
+    seedFamily('F');
+    seedFamily('C');
+    if (INCLUDE_SCREEN_DEFAULT){ \$('dnb-card-S').style.display = ''; seedFamily('S'); }
+
+    if (NEXT_NUMBER){
+      \$('dnb-number').value = NEXT_NUMBER;
+      setHint('dnb-numberHint', 'Next free number', 'good');
+    }
+
+    renderRecent(false);
+    refreshNumbers();
+    updatePreview();
+
+    \$('dnb-series').addEventListener('change', onSeriesChange);
+    \$('dnb-class').addEventListener('change', markClassManual);
+    \$('dnb-rev').addEventListener('change', function(){ refreshNumbers(); updatePreview(); });
+    \$('dnb-number').addEventListener('input', onNumberInput);
+    \$('dnb-number').addEventListener('blur', checkNumber);
+    \$('dnb-desc').addEventListener('input', updatePreview);
+
+    // Arrow keys work the search dropdown whenever it is open. Enter loads a
+    // door that exists; on a free number it advances to Description.
+    \$('dnb-number').addEventListener('keydown', function(e){
+      if (doorAcKey(e)) return;
+      if (e.key !== 'Enter') return;
+      e.preventDefault();
+      if (mode === 'edit' || \$('dnb-doorAc').classList.contains('open')) loadDoor();
+      else \$('dnb-desc').focus();
+    });
+    \$('dnb-desc').addEventListener('keydown', function(e){
+      if (e.key === 'Enter'){
+        e.preventDefault();
+        var first = \$('dnb-comp-item-F0');
+        if (first) first.focus();
+      }
+    });
+
+    // Scoped to the wrapper — does not intercept clicks elsewhere in NetSuite.
+    root.addEventListener('click', function(e){
+      if (!e.target.closest('.ac-wrap')) closeAllAc();
+    });
+
+    // Mousedown inside a dropdown must not blur the field. preventDefault on
+    // an .ac-item keeps focus on the input, so the click resolves against the
+    // row actually under the cursor instead of racing the blur handler.
+    // Scrollbar drags (target is the list, not an item) still work — they only
+    // set the flag, which is enough to keep checkNumber out of the way.
+    // Capture phase so it runs before NetSuite's own page scripts.
+    root.addEventListener('mousedown', function(e){
+      if (!e.target.closest('.ac-list')) return;
+      acClicking = true;
+      if (e.target.closest('.ac-item')) e.preventDefault();
+    }, true);
+    document.addEventListener('mouseup', function(){ acClicking = false; });
+
+    // Manual Tab handling. Tabbing through a plain input normally selects
+    // nothing, so the next keystroke lands after the existing "1" instead of
+    // replacing it. Owning Tab ourselves means we focus AND select in the same
+    // keystroke, with no gap for NetSuite's own page scripts to intervene.
+    root.addEventListener('keydown', function(e){
+      if (e.key !== 'Tab') return;
+
+      var stops = Array.prototype.slice.call(root.querySelectorAll('.tabstop'))
+        .filter(function(el){ return el.offsetParent !== null; });  // skip hidden rows
+      var cur = stops.indexOf(document.activeElement);
+      if (cur === -1) return;   // focus isn't on one of our stops
+
+      var next = cur + (e.shiftKey ? -1 : 1);
+      if (next < 0 || next >= stops.length) return;   // fall off our list
+
+      e.preventDefault();
+      e.stopPropagation();
+      var el = stops[next];
+      el.focus();
+      if (typeof el.select === 'function' && el.tagName === 'INPUT' &&
+          el.type !== 'hidden' && el.type !== 'checkbox') {
+        el.select();
+      }
+    }, true);
+  }
+
+  if (document.readyState === 'loading'){
+    document.addEventListener('DOMContentLoaded', init);
+  } else {
+    init();
+  }
+
+  return {
+    addComponent: addComponent,
+    addStep: addStep,
+    removeRow: removeRow,
+    acInput: acInput,
+    acKey: acKey,
+    acPick: acPick,
+    markSourceManual: markSourceManual,
+    onOpChange: onOpChange,
+    opRevert: opRevert,
+    doorAcPick: doorAcPick,
+    loadDoor: loadDoor,
+    toggleScreen: toggleScreen,
+    clearForm: clearForm,
+    clearRecent: clearRecent,
+    submit: submit,
+    submitNewRev: submitNewRev,
+    reset: reset
+  };
+})();
+</script>
+</div>`;
+  }
+
+  return { onRequest };
+});
