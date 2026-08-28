@@ -67,12 +67,34 @@
  *   its name. Name matching collapses whitespace, or that step silently
  *   saves with no cost template.
  *
- * TEMPLATES
- *   Three template items already exist and are cloned per family:
- *     DR-4000-TEMPLATE (30411), F-4000-TEMPLATE (30412), C-4000-TEMPLATE (30413)
- *   There is no S- template. Screens carry field-for-field identical values
- *   to frames on all 102 live examples, so S clones the F template. To change
- *   what new doors default to, edit those items in NetSuite, not this script.
+ * TEMPLATES — THE WHOLE BUILD, NOT JUST THE ITEM FIELDS
+ *   A template is a complete door family that happens to be named TEMPLATE:
+ *     DR-4000-TEMPLATE (30411)  BOM 11560, 6 lines (F, C, + 4 loose trims)
+ *     F-4000-TEMPLATE  (30412)  BOM 11558, 3 lines, routing EXT CUT / EXT WELD
+ *     C-4000-TEMPLATE  (30413)  BOM 11559, 6 lines, routing EXT CUT / LAMINATION / ROUTING
+ *
+ *   Picking one fills the ENTIRE form: item field inheritance as before, but
+ *   also every component line with its quantity and item source, and every
+ *   routing step with its work center, cost template, run rate and setup. The
+ *   usual job then becomes adjusting quantities to the new door's size —
+ *   which is the point. Rows stay fully editable and you can add or delete
+ *   any of them.
+ *
+ *   TEMPLATES ARE DISCOVERED, NOT HARD-CODED. Anything matching
+ *   CFG.TEMPLATE_DOOR_PATTERN ('DR-%TEMPLATE%') shows up in the picker at the
+ *   top of the form, and its C-/F-/S- siblings are found by swapping the
+ *   prefix. To add a 6000-series template, build DR-6000-TEMPLATE the way you
+ *   want it and it appears in the list — no script change, no redeploy. Reload
+ *   with ?refresh=1 if you built it in the last hour and don't want to wait
+ *   out the cache.
+ *
+ *   A template need not have all four families. DR-4000-TEMPLATE has no
+ *   screen, so ticking "include screen door" on it falls back to the built-in
+ *   catalog default (one EXT CUT step, blank components). Build an
+ *   S-4000-TEMPLATE and that stops being a fallback.
+ *
+ *   To change what new doors default to, edit the template family in
+ *   NetSuite, not this script.
  *
  * WHAT IS DELIBERATELY NOT HERE
  *   No weight, no shipping dimensions, no Order Tracking Sorter, no coated
@@ -101,13 +123,40 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
 
   // ─── CONFIG ───────────────────────────────────────────────────────────────
   const CFG = {
-    // One template per family. S has no template of its own — every one of the
-    // 102 live screens matches its frame field for field, so it clones F.
-    TEMPLATE_ITEMS: {
+    // ── Templates ──────────────────────────────────────────────────────
+    // Templates are FOUND, not listed here. Any active assembly whose name
+    // matches this pattern becomes an option in the picker, and its C-/F-/S-
+    // siblings are located by swapping the DR- prefix. Build
+    // DR-6000-TEMPLATE and it shows up on the next page load; no script
+    // change needed. SQL LIKE syntax: % is the wildcard.
+    TEMPLATE_DOOR_PATTERN: 'DR-%TEMPLATE%',
+
+    // Selected when the page opens. Blank means "first one alphabetically".
+    // Set to '' and DEFAULT_TEMPLATE_NONE below to open with an empty form.
+    DEFAULT_TEMPLATE: 'DR-4000-TEMPLATE',
+
+    // Whether the picker offers a "— none —" option at all. With it, you get
+    // blank grids and the built-in catalog defaults instead of a template.
+    ALLOW_NO_TEMPLATE: true,
+
+    // A template's description is a real door description with a marker on
+    // the front ("TEMPLATE - 4000 ENT SQ SD RH WB 32 X 78 ML 805 ..."). Seeded
+    // into the description box with the marker stripped, so the job is editing
+    // the size and options rather than typing forty tokens from scratch. Only
+    // ever fills an EMPTY box — it can't overwrite what you typed.
+    SEED_DESCRIPTION_FROM_TEMPLATE: true,
+    TEMPLATE_DESC_MARKER: /^\s*TEMPLATE\s*[-:]?\s*/i,
+
+    // Same deal for the cut list, if the template carries one.
+    SEED_CUT_DETAILS_FROM_TEMPLATE: true,
+
+    // Used only when the picker is on "— none —", so item field inheritance
+    // still has something to work from.
+    FALLBACK_TEMPLATE_ITEMS: {
       DR: '30411',   // DR-4000-TEMPLATE
       F:  '30412',   // F-4000-TEMPLATE
       C:  '30413',   // C-4000-TEMPLATE
-      S:  '30412'    // no S template exists; frame is the correct stand-in
+      S:  '30412'    // no S template exists yet; frame is the right stand-in
     },
 
     // GEN-Y DOOR. Written to both `location` and `preferredlocation` — every
@@ -161,7 +210,7 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
     CACHE_TTL_LISTS: 3600,
     CACHE_TTL_TEMPLATE: 1800,
 
-    CACHE_KEYS: ['workcenters', 'costtemplates', 'classes'],
+    CACHE_KEYS: ['workcenters', 'costtemplates', 'classes', 'templates'],
 
     // Sourcing re-derives dependent fields on save. Every field a new door
     // needs is copied explicitly off its template, so sourcing mostly redoes
@@ -429,8 +478,22 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
     try {
       const c = nsCache.getCache({ name: CFG.CACHE_NAME, scope: nsCache.Scope.PUBLIC });
       const keys = (CFG.CACHE_KEYS || []).slice();
-      for (const k in CFG.TEMPLATE_ITEMS) {
-        const key = 'tpl_' + CFG.TEMPLATE_ITEMS[k];
+      // Every template's field snapshot and fill payload, including ones added
+      // since this script was written — which is the whole point of the
+      // refresh escape hatch.
+      let known = [];
+      try { known = listDoorTemplates(true) || []; } catch (e) { known = []; }
+      for (const t of known) {
+        for (const f of ALL_FAMILIES) {
+          if (!t.items || !t.items[f]) continue;
+          const key = 'tpl_' + t.items[f];
+          if (keys.indexOf(key) === -1) keys.push(key);
+        }
+        const fillKey = 'tplfill_' + t.key;
+        if (keys.indexOf(fillKey) === -1) keys.push(fillKey);
+      }
+      for (const k in (CFG.FALLBACK_TEMPLATE_ITEMS || {})) {
+        const key = 'tpl_' + CFG.FALLBACK_TEMPLATE_ITEMS[k];
         if (keys.indexOf(key) === -1) keys.push(key);
       }
       for (const k of keys) {
@@ -521,6 +584,8 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
       if (api === 'workcenters')   return listWorkCenters();
       if (api === 'costtemplates') return listCostTemplates();
       if (api === 'classes')       return listClasses();
+      if (api === 'templates')     return listDoorTemplates();
+      if (api === 'template')      return loadTemplateFill(params.term || '');
       if (api === 'nextnumber')    return { number: nextDoorNumber() };
       if (api === 'checkdoor')     return checkDoorNumber(params.term || '');
       if (api === 'loaddoor')      return loadDoorForEdit(params.term || '');
@@ -924,6 +989,162 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
     return hit ? String(hit.id) : '';
   }
 
+  // ─── TEMPLATES ────────────────────────────────────────────────────────────
+  // Every door family named like a template, with its siblings resolved. This
+  // is a discovery query on purpose: adding DR-6000-TEMPLATE to NetSuite is
+  // all it takes to add a 6000-series option to the picker.
+  //
+  // `key` is the DR item's own name, which is what the picker sends back and
+  // what the build re-resolves against — so a template can be renamed or
+  // replaced without anything here holding a stale internal ID.
+  function listDoorTemplates(skipCache) {
+    const produce = () => {
+      let rows = [];
+      try {
+        rows = query.runSuiteQL({
+          query: `SELECT id, itemid, displayname, class
+                  FROM item
+                  WHERE itemtype = 'Assembly' AND isinactive = 'F'
+                    AND UPPER(itemid) LIKE '${sq(CFG.TEMPLATE_DOOR_PATTERN).toUpperCase()}'
+                  ORDER BY itemid`
+        }).asMappedResults();
+      } catch (e) {
+        log.error({ title: 'listDoorTemplates', details: e.toString() });
+        return [];
+      }
+      if (!rows.length) return [];
+
+      // Siblings, in one query rather than one per template.
+      const wanted = [];
+      const siblingOf = {};
+      for (const r of rows) {
+        const tail = String(r.itemid).slice(CFG.FAMILY_PREFIX.DR.length);
+        for (const f of ['F', 'C', 'S']) {
+          const nm = CFG.FAMILY_PREFIX[f] + tail;
+          wanted.push(nm);
+          siblingOf[nm.toUpperCase()] = { key: r.itemid, family: f };
+        }
+      }
+      const found = checkPartNumbers(wanted);
+
+      const out = [];
+      for (const r of rows) {
+        const items = { DR: String(r.id) };
+        const tail = String(r.itemid).slice(CFG.FAMILY_PREFIX.DR.length);
+        for (const f of ['F', 'C', 'S']) {
+          const id = found[(CFG.FAMILY_PREFIX[f] + tail).toUpperCase()];
+          if (id) items[f] = String(id);
+        }
+        // A template named DR-4000-TEMPLATE implies series 4000. Anything
+        // else (DR-ENT-TEMPLATE) just leaves the series for you to pick.
+        const sm = String(r.itemid).match(/^DR-([0-9]{3,5})-/);
+        out.push({
+          key: r.itemid,
+          label: r.itemid,
+          series: sm ? sm[1] : '',
+          classId: r.class ? String(r.class) : '',
+          items: items,
+          families: ALL_FAMILIES.filter(f => items[f])
+        });
+      }
+      log.audit({
+        title: 'door templates found',
+        details: out.map(t => t.key + ' [' + t.families.join('/') + ']').join(', ')
+      });
+      return out;
+    };
+
+    if (skipCache) return produce();
+    return cached('templates', CFG.CACHE_TTL_LISTS, produce);
+  }
+
+  function findTemplate(key) {
+    if (!key) return null;
+    const k = normName(key);
+    return listDoorTemplates().filter(t => normName(t.key) === k)[0] || null;
+  }
+
+  // Everything the form needs to fill itself from a template: per family, the
+  // component lines with their quantities and sources, and the routing steps
+  // with their work centers and cost templates. Read off the template's live
+  // BOM and routing, so editing the template in NetSuite is how you change
+  // what new doors start as.
+  function loadTemplateFill(key) {
+    const tpl = findTemplate(key);
+    if (!tpl) return { ok: false, message: 'Template "' + key + '" was not found.' };
+
+    return cached('tplfill_' + tpl.key, CFG.CACHE_TTL_TEMPLATE, () => {
+      const out = {
+        ok: true,
+        key: tpl.key,
+        series: tpl.series,
+        classId: tpl.classId,
+        families: {},
+        warnings: []
+      };
+
+      for (const f of ALL_FAMILIES) {
+        const itemId = tpl.items[f];
+        if (!itemId) continue;
+        const unit = loadFamilyUnit(f, templateNameFor(tpl, f), itemId, out.warnings);
+        if (!unit) continue;
+
+        // Strip the TEMPLATE marker off the front so the description is a
+        // usable starting point rather than something you have to edit twice.
+        if (f === 'DR') {
+          out.description = String(unit.description || '').replace(CFG.TEMPLATE_DESC_MARKER, '').trim();
+          out.cutDetails = unit.cutDetails || '';
+          if (!out.classId) out.classId = unit.classId || '';
+        }
+
+        out.families[f] = {
+          itemId: itemId,
+          partNumber: unit.partNumber,
+          components: unit.components || [],
+          steps: unit.steps || []
+        };
+      }
+
+      // The door's own sub-assembly lines point at the TEMPLATE frame and
+      // core. Those are placeholders for the real ones this build is about to
+      // create, so they're stripped out here — the form re-derives them from
+      // the new door number. Only the loose hardware carries over.
+      const dr = out.families.DR;
+      if (dr) {
+        const subNames = {};
+        for (const f of ['F', 'C', 'S']) {
+          if (tpl.items[f]) subNames[normName(templateNameFor(tpl, f))] = true;
+        }
+        const kept = [], dropped = [];
+        for (const c of dr.components) {
+          if (subNames[normName(c.itemNumber)]) dropped.push(c.itemNumber);
+          else kept.push(c);
+        }
+        dr.components = kept;
+        if (dropped.length) {
+          log.audit({
+            title: 'template sub-assembly lines stripped',
+            details: tpl.key + ': ' + dropped.join(', ') + ' — re-derived per door'
+          });
+        }
+      }
+
+      if (!out.families.DR) out.warnings.push(tpl.key + ' itself could not be read.');
+      for (const f of ['F', 'C']) {
+        if (!out.families[f]) {
+          out.warnings.push('This template has no ' + FAMILY_LABEL[f].toLowerCase() +
+                            ' — that grid starts empty.');
+        }
+      }
+      return out;
+    });
+  }
+
+  function templateNameFor(tpl, family) {
+    const tail = String(tpl.key).slice(CFG.FAMILY_PREFIX.DR.length);
+    return CFG.FAMILY_PREFIX[family] + tail;
+  }
+
   // ─── EDIT MODE — LOAD ─────────────────────────────────────────────────────
   // Pulls the whole family: for each of DR/F/C/S that exists, its item fields,
   // BOM, current revision, components, and default routing steps.
@@ -1300,8 +1521,32 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
       timer.mark('validate');
 
       // ── Shared context ─────────────────────────────────────────────────
+      // Field inheritance comes from whichever template the person picked. It
+      // is re-resolved here rather than trusted from the form, so a template
+      // renamed or inactivated between page load and submit fails loudly
+      // instead of cloning a record that no longer means what it did.
+      const tpl = p.templateKey ? findTemplate(p.templateKey) : null;
+      if (p.templateKey && !tpl) {
+        throw new Error('Template "' + p.templateKey + '" is no longer available. ' +
+                        'Reload the page and pick again.');
+      }
+      const templateItems = {};
+      for (const f of families.concat(['DR'])) {
+        templateItems[f] = (tpl && tpl.items[f]) ||
+                           (CFG.FALLBACK_TEMPLATE_ITEMS || {})[f] || '';
+      }
+      // A template with no screen still needs SOMETHING for the screen's item
+      // fields. Its own frame is the right stand-in — every one of the 102
+      // live screens matches its frame field for field.
+      if (families.indexOf('S') !== -1 && !((tpl && tpl.items.S))) {
+        templateItems.S = templateItems.F || templateItems.S;
+      }
+
       const defaults = {};
-      for (const f of families.concat(['DR'])) defaults[f] = getTemplateDefaults(f);
+      for (const f of families.concat(['DR'])) {
+        defaults[f] = getTemplateDefaultsById(templateItems[f]);
+      }
+      out.templateUsed = tpl ? tpl.key : null;
       timer.mark('template');
 
       let subsidiaryId = CFG.SUBSIDIARY_ID;
@@ -2077,8 +2322,7 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
 
   // ─── TEMPLATE ITEM DEFAULTS ───────────────────────────────────────────────
   let _defaultsCache = {};
-  function getTemplateDefaults(family) {
-    const id = CFG.TEMPLATE_ITEMS[family];
+  function getTemplateDefaultsById(id) {
     if (!id) return { _fields: {}, subsidiary: '', name: '' };
     if (_defaultsCache[id]) return _defaultsCache[id];
     _defaultsCache[id] = cached('tpl_' + id, CFG.CACHE_TTL_TEMPLATE, () => readTemplateDefaults(id));
@@ -2227,32 +2471,66 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
       notices.push('Could not work out the next free door number — type one in.');
     }
 
-    // Template status banner
+    // Templates, discovered. Everything matching the pattern becomes a picker
+    // option, so this banner is also the answer to "did NetSuite see the
+    // template I just built?"
+    let templates = [];
+    try { templates = listDoorTemplates() || []; }
+    catch (e) {
+      log.error({ title: 'buildInlineHtml templates', details: e.toString() });
+      notices.push('Templates could not be loaded: ' + e.message);
+    }
+    if (!templates.length) {
+      notices.push('No door templates found matching "' + CFG.TEMPLATE_DOOR_PATTERN +
+                   '". The form will open empty — build a DR-…-TEMPLATE family to fix that.');
+    }
+
+    // Preselect: the configured default if it exists, else the first found.
+    let defaultTemplate = '';
+    if (templates.length) {
+      const want = normName(CFG.DEFAULT_TEMPLATE);
+      const hit = want ? templates.filter(t => normName(t.key) === want)[0] : null;
+      defaultTemplate = hit ? hit.key : templates[0].key;
+      if (want && !hit) {
+        notices.push('CFG.DEFAULT_TEMPLATE "' + CFG.DEFAULT_TEMPLATE +
+                     '" was not found — opening with ' + defaultTemplate + ' instead.');
+      }
+    }
+
+    // Fill payload for the preselected template, embedded so the form arrives
+    // already filled instead of flashing empty and then populating.
+    let defaultFill = null;
+    if (defaultTemplate) {
+      try {
+        const f = loadTemplateFill(defaultTemplate);
+        if (f && f.ok) defaultFill = f;
+        else if (f && f.message) notices.push(f.message);
+      } catch (e) {
+        log.error({ title: 'buildInlineHtml default fill', details: e.toString() });
+        notices.push('Could not read ' + defaultTemplate + ': ' + e.message);
+      }
+    }
+    if (defaultFill && defaultFill.warnings && defaultFill.warnings.length) {
+      for (const w of defaultFill.warnings) notices.push(w);
+    }
+
     let banner = '';
     try {
-      const parts = [];
-      let anyMissing = false;
-      for (const f of ALL_FAMILIES) {
-        const id = CFG.TEMPLATE_ITEMS[f];
-        if (!id) { parts.push(FAMILY_LABEL[f] + ': none'); anyMissing = true; continue; }
-        const d = getTemplateDefaults(f);
-        const count = Object.keys(d._fields || {}).length;
-        if (!count) anyMissing = true;
-        parts.push(FAMILY_LABEL[f] + ': <a href="' + NS_ITEM + id + '" target="_blank">' +
-                   escHtml(d.name || id) + '</a> (' + count + ')');
-      }
-      banner = '<div class="tpl">Inheriting from ' + parts.join(' &middot; ') +
+      const parts = templates.map(t =>
+        '<a href="' + NS_ITEM + t.items.DR + '" target="_blank">' + escHtml(t.key) + '</a>' +
+        ' [' + t.families.join('/') + ']');
+      banner = '<div class="tpl">' +
+               (parts.length
+                 ? templates.length + ' template' + (templates.length === 1 ? '' : 's') +
+                   ': ' + parts.join(' &middot; ')
+                 : 'No templates found') +
                ' &middot; location <b>' + escHtml(CFG.LOCATION_NAME) + '</b>' +
                ' &middot; ' + wcRows.length + ' work centers, ' + ctRows.length + ' cost templates' +
                (nextNum ? ' &middot; next number <b>' + escHtml(nextNum) + '</b>' : '') +
                (_cacheCleared ? ' &middot; <b>caches refreshed</b>' : '') +
                '</div>';
-      if (anyMissing) {
-        notices.push('At least one template item could not be read. New items will be missing ' +
-                     'accounts, tax schedule and units.');
-      }
     } catch (e) {
-      banner = '<div class="warn">Could not read the template items: ' + escHtml(e.message) + '</div>';
+      banner = '<div class="warn">Could not list the templates: ' + escHtml(e.message) + '</div>';
     }
 
     if (notices.length) {
@@ -2372,6 +2650,16 @@ ${hideTitle}
 #${WRAP} .card-body{padding:14px 16px}
 #${WRAP} .sub-label{font-family:var(--dnb-mono);font-size:9px;text-transform:uppercase;
   letter-spacing:.1em;color:var(--dnb-muted);margin-bottom:5px}
+
+/* The template picker sits above everything else because it decides what
+   everything else starts as. */
+#${WRAP} .tpl-row{display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap;
+  padding:10px 12px;margin-bottom:12px;background:#eef4fa;border:1px solid #a8c4e0;
+  border-radius:5px}
+#${WRAP} .tpl-pick{flex:1 1 320px;min-width:0}
+#${WRAP} .tpl-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap;min-width:0}
+#${WRAP} .tpl-actions .hint{min-height:0}
+@media(max-width:620px){#${WRAP} .tpl-row{flex-direction:column;align-items:stretch}}
 /* The derived part number for each family, shown so the cascade is never a
    surprise — you type one number and four items come out. */
 #${WRAP} .fam-num{font-family:var(--dnb-mono);font-size:11px;color:var(--dnb-blue);
@@ -2567,6 +2855,17 @@ ${banner}
     <span class="card-note" id="dnb-doorNote">Pick a series and take the next number, or type an existing door number to load it.</span>
   </div>
   <div class="card-body">
+    <div class="tpl-row">
+      <div class="tpl-pick">
+        <label for="dnb-template">Build from template</label>
+        <select id="dnb-template" class="tabstop"></select>
+      </div>
+      <div class="tpl-actions">
+        <button type="button" id="dnb-refillBtn" onclick="GNYDNB.refill()">Re-fill from template</button>
+        <span class="hint" id="dnb-templateHint" style="margin-top:0">&nbsp;</span>
+      </div>
+    </div>
+
     <div class="grid g4">
       <div>
         <label for="dnb-series">Series</label>
@@ -2697,6 +2996,14 @@ var GNYDNB = (function(){
   var CLASSES = ${cls};
   var ITEM_SOURCES = ${src};
   var SERIES = ${JSON.stringify(seriesOut)};
+  var TEMPLATES = ${JSON.stringify(templates)};
+  var DEFAULT_TEMPLATE = ${JSON.stringify(defaultTemplate)};
+  var ALLOW_NO_TEMPLATE = ${CFG.ALLOW_NO_TEMPLATE ? 'true' : 'false'};
+  var SEED_DESC = ${CFG.SEED_DESCRIPTION_FROM_TEMPLATE ? 'true' : 'false'};
+  var SEED_CUT = ${CFG.SEED_CUT_DETAILS_FROM_TEMPLATE ? 'true' : 'false'};
+  // The preselected template's fill payload, embedded so the form arrives
+  // already populated rather than flashing empty and filling a beat later.
+  var FILL_CACHE = ${defaultFill ? '{' + JSON.stringify(defaultTemplate) + ': ' + JSON.stringify(defaultFill) + '}' : '{}'};
   var OPERATIONS = ${JSON.stringify(OPERATIONS)};
   var DEFAULT_STEPS = ${JSON.stringify(DEFAULT_STEPS)};
   var DEFAULT_COMPONENT_ROWS = ${JSON.stringify(DEFAULT_COMPONENT_ROWS)};
@@ -3070,6 +3377,10 @@ var GNYDNB = (function(){
     \$('dnb-cut').value = r.cutDetails || '';
     \$('dnb-screen').checked = !!r.hasScreen;
     \$('dnb-newOnlyRow').style.display = 'none';
+    // Templates describe what a NEW door starts as. Applying one to a door
+    // that already exists would silently replace its real BOM with a
+    // template's, so the picker is locked out until you leave edit mode.
+    setTemplatePickerEnabled(false, 'Locked while editing ' + r.doorNumber + '.');
     \$('dnb-doorNote').textContent = 'Editing ' + r.doorNumber + ' — ' +
       ALL_FAMILIES.filter(function(f){ return r.families[f]; })
         .map(function(f){ return FAMILY_LABEL[f].toLowerCase(); }).join(', ') + ' loaded.';
@@ -3172,6 +3483,7 @@ var GNYDNB = (function(){
     \$('dnb-submit').textContent = 'Create door';
     \$('dnb-submit').onclick = submit;
     \$('dnb-newRevBtn').style.display = 'none';
+    setTemplatePickerEnabled(true, '');
     for (var i=0;i<ALL_FAMILIES.length;i++){
       var revRow = \$('dnb-editRev-' + ALL_FAMILIES[i]);
       if (revRow) revRow.style.display = 'none';
@@ -3187,7 +3499,10 @@ var GNYDNB = (function(){
     var card = \$('dnb-card-S');
     if (card) card.style.display = on ? '' : 'none';
     if (on && !rowCount.S){
-      seedFamily('S');
+      // From the template if it has a screen, otherwise the catalog default.
+      // DR-4000-TEMPLATE has no S sibling today, so this is the fallback path
+      // until an S-4000-TEMPLATE exists.
+      fillFamily('S', (templateFill && templateFill.families) ? templateFill.families.S : null);
     }
     refreshNumbers();
     updatePreview();
@@ -3449,14 +3764,224 @@ var GNYDNB = (function(){
     return i;
   }
 
-  // Opens a family with its blank component rows and its default routing —
-  // the shape the shop actually runs, so most doors need no routing edits at
-  // all. Rows stay fully editable.
-  function seedFamily(fam){
+  // ── templates ───────────────────────────────────────────────────────────
+  // The picker decides what every grid below it starts as. Templates are
+  // discovered server-side, so building DR-6000-TEMPLATE in NetSuite is all
+  // it takes to add an option here.
+  var templateFill = null;    // fill payload for the currently selected template
+
+  function templateOptionsHtml(){
+    var h = ALLOW_NO_TEMPLATE ? '<option value="">— none (blank form) —</option>' : '';
+    for (var i=0;i<TEMPLATES.length;i++){
+      h += '<option value="' + esc(TEMPLATES[i].key) + '">' + esc(TEMPLATES[i].label) +
+           '  [' + TEMPLATES[i].families.join('/') + ']</option>';
+    }
+    return h;
+  }
+
+  function setTemplatePickerEnabled(on, msg){
+    \$('dnb-template').disabled = !on;
+    \$('dnb-refillBtn').disabled = !on;
+    setHint('dnb-templateHint', msg || '', on ? '' : 'bad');
+  }
+
+  function selectedTemplate(){
+    var k = \$('dnb-template').value;
+    if (!k) return null;
+    for (var i=0;i<TEMPLATES.length;i++){ if (TEMPLATES[i].key === k) return TEMPLATES[i]; }
+    return null;
+  }
+
+  // True once anything has been typed into a grid, so re-filling can ask
+  // first instead of silently throwing away work.
+  function gridsAreDirty(){
+    for (var i=0;i<ALL_FAMILIES.length;i++){
+      var fam = ALL_FAMILIES[i];
+      for (var r=0;r<rowCount[fam];r++){
+        var el = \$('dnb-comp-item-' + fam + r);
+        if (el && el.value.trim()) return true;
+      }
+    }
+    return false;
+  }
+
+  function onTemplateChange(){
+    var t = selectedTemplate();
+    if (!t){
+      templateFill = null;
+      setHint('dnb-templateHint', 'Blank form — grids start empty.', '');
+      seedAllFamilies();
+      return;
+    }
+    fetchTemplate(t.key, function(fill){
+      templateFill = fill;
+      applyTemplate(fill, true);
+    });
+  }
+
+  // Explicit "Re-fill" — the escape hatch for when you've edited the grids
+  // and want to start over without losing the number or description.
+  function refill(){
+    if (mode === 'edit'){
+      setHint('dnb-templateHint', 'Templates do not apply while editing an existing door.', 'bad');
+      return;
+    }
+    if (gridsAreDirty() &&
+        !window.confirm('Re-fill from the template? Component and routing rows will be replaced.')){
+      return;
+    }
+    var t = selectedTemplate();
+    if (!t){ seedAllFamilies(); return; }
+    fetchTemplate(t.key, function(fill){
+      templateFill = fill;
+      applyTemplate(fill, false);   // false = overwrite description/cut too
+    });
+  }
+
+  function fetchTemplate(key, done){
+    if (FILL_CACHE[key]){ done(FILL_CACHE[key]); return; }
+    setHint('dnb-templateHint', 'Loading ' + key + '…', '');
+    var xhr = new XMLHttpRequest();
+    xhr.open('GET', baseUrl() + '&api=template&term=' + encodeURIComponent(key), true);
+    xhr.onload = function(){
+      try {
+        var t = xhr.responseText, s = t.indexOf('{'), e = t.lastIndexOf('}');
+        var r = JSON.parse(t.slice(s, e+1));
+        if (!r.ok){ setHint('dnb-templateHint', r.message || 'Could not load template.', 'bad'); return; }
+        FILL_CACHE[key] = r;
+        done(r);
+      } catch(err){
+        setHint('dnb-templateHint', 'Unexpected response loading the template.', 'bad');
+      }
+    };
+    xhr.onerror = function(){ setHint('dnb-templateHint', 'Request failed.', 'bad'); };
+    xhr.send();
+  }
+
+  // Fills every grid from the template: components with their quantities and
+  // sources, routing steps with their work centers and cost templates. The
+  // job left is adjusting quantities to the new door's size.
+  //
+  // gentle = true when the fill was triggered by switching templates rather
+  // than by an explicit Re-fill. It leaves an already-typed description and
+  // cut list alone, because losing what you typed to a stray dropdown change
+  // is worse than a stale starting description.
+  function applyTemplate(fill, gentle){
+    if (!fill){ seedAllFamilies(); return; }
+
+    if (fill.series && !\$('dnb-series').value){
+      \$('dnb-series').value = fill.series;
+      onSeriesChange();
+    }
+    if (fill.classId && !classUserSet){
+      \$('dnb-class').value = fill.classId;
+    }
+    if (SEED_DESC && fill.description && (!gentle || !\$('dnb-desc').value.trim())){
+      \$('dnb-desc').value = fill.description;
+      syncDescriptionSeries();
+    }
+    if (SEED_CUT && fill.cutDetails && (!gentle || !\$('dnb-cut').value.trim())){
+      \$('dnb-cut').value = fill.cutDetails;
+    }
+
+    for (var i=0;i<ALL_FAMILIES.length;i++){
+      var fam = ALL_FAMILIES[i];
+      if (fam === 'S' && !\$('dnb-screen').checked){ clearFamilyGrids(fam); continue; }
+      fillFamily(fam, fill.families ? fill.families[fam] : null);
+    }
+
+    var counts = [];
+    for (var k=0;k<ALL_FAMILIES.length;k++){
+      var f = ALL_FAMILIES[k];
+      if (f === 'S' && !\$('dnb-screen').checked) continue;
+      counts.push(FAMILY_LABEL[f].toLowerCase() + ' ' + rowCount[f] +
+                  (BUILDS_ROUTING[f] ? '/' + stepCount[f] : ''));
+    }
+    setHint('dnb-templateHint',
+      'Filled from ' + fill.key + ' — ' + counts.join(', ') + '. Adjust quantities.', 'good');
+
+    refreshNumbers();
+    updatePreview();
+  }
+
+  // One family's grids from the template's own BOM and routing. A family the
+  // template doesn't have (no screen on DR-4000-TEMPLATE) falls back to the
+  // built-in catalog default rather than opening empty.
+  function fillFamily(fam, unit){
+    clearFamilyGrids(fam);
+
+    if (!unit){ seedFamily(fam); return; }
+
+    (unit.components || []).forEach(function(c){
+      var i = addComponent(fam, false);
+      \$('dnb-comp-item-' + fam + i).value = c.itemNumber + '  —  ' + c.desc;
+      \$('dnb-comp-id-' + fam + i).value = c.itemId;
+      \$('dnb-comp-qty-' + fam + i).value = c.quantity;
+      \$('dnb-comp-src-' + fam + i).value = c.itemSource;
+      var row = \$('dnb-comp-' + fam + i);
+      // Marked manual so the item-type rule can't quietly re-source a line
+      // the template already decided.
+      if (row){ row.dataset.itemType = c.itemType || ''; row.dataset.srcManual = '1'; }
+    });
+    // Always leave one blank row so adding a component needs no extra click.
+    addComponent(fam, false);
+
+    if (!BUILDS_ROUTING[fam]) return;
+
+    (unit.steps || []).forEach(function(s){
+      var i = addStep(fam, false);
+      \$('dnb-step-seq-' + fam + i).value = s.sequence;
+      // Match the loaded step back onto the catalog by name AND cost
+      // template — EXT CUT exists on both frames and cores with different
+      // templates, so the name alone cannot say which entry this is.
+      var opIdx = -1, nameHit = -1;
+      var cat = OPERATIONS[fam] || [];
+      for (var q=0;q<cat.length;q++){
+        if (norm(cat[q].op) !== norm(s.operationName)) continue;
+        if (nameHit === -1) nameHit = q;
+        if (s.costTemplateId &&
+            String(matchByName(COST_TEMPLATES, cat[q].ct)) === String(s.costTemplateId)){
+          opIdx = q; break;
+        }
+      }
+      if (opIdx === -1) opIdx = nameHit;
+      if (opIdx >= 0){
+        \$('dnb-step-op-' + fam + i).value = opIdx;
+      } else {
+        // An operation the catalog doesn't know still has to survive the
+        // round trip, so it comes back as a custom step rather than blank.
+        \$('dnb-step-op-' + fam + i).value = 'custom';
+        onOpChange(fam, i);
+        \$('dnb-step-optxt-' + fam + i).value = s.operationName;
+      }
+      // The template's own values win over the catalog defaults onOpChange
+      // just wrote — the template is the more specific answer.
+      \$('dnb-step-wc-' + fam + i).value = s.workCenterId || '';
+      \$('dnb-step-ct-' + fam + i).value = s.costTemplateId || '';
+      \$('dnb-step-run-' + fam + i).value = s.runRate;
+      \$('dnb-step-setup-' + fam + i).value = s.setupTime;
+    });
+
+    if (!(unit.steps || []).length) seedSteps(fam);
+  }
+
+  function clearFamilyGrids(fam){
     \$('dnb-compBody-' + fam).innerHTML = ''; rowCount[fam] = 0;
+    if (BUILDS_ROUTING[fam]){
+      \$('dnb-stepBody-' + fam).innerHTML = ''; stepCount[fam] = 0;
+    }
+  }
+
+  // No template for this family: blank component rows plus the routing the
+  // shop most often runs, from the built-in catalog.
+  function seedFamily(fam){
+    clearFamilyGrids(fam);
     var n = DEFAULT_COMPONENT_ROWS[fam] || 1;
     for (var i=0;i<n;i++) addComponent(fam, false);
+    seedSteps(fam);
+  }
 
+  function seedSteps(fam){
     if (!BUILDS_ROUTING[fam]) return;
     \$('dnb-stepBody-' + fam).innerHTML = ''; stepCount[fam] = 0;
     var wanted = DEFAULT_STEPS[fam] || [];
@@ -3471,6 +3996,16 @@ var GNYDNB = (function(){
       }
     }
     if (!wanted.length) addStep(fam, false);
+  }
+
+  function seedAllFamilies(){
+    seedFamily('DR');
+    seedFamily('F');
+    seedFamily('C');
+    if (\$('dnb-screen').checked) seedFamily('S');
+    else clearFamilyGrids('S');
+    refreshNumbers();
+    updatePreview();
   }
 
   // ── preview ─────────────────────────────────────────────────────────────
@@ -3589,6 +4124,9 @@ var GNYDNB = (function(){
 
     var payload = {
       action: 'build',
+      // The server re-resolves this rather than trusting item IDs from the
+      // form, so a template renamed since page load fails loudly.
+      templateKey: \$('dnb-template').value || '',
       series: series,
       number: number,
       description: desc,
@@ -3711,6 +4249,10 @@ var GNYDNB = (function(){
            '</li>';
     }
     h += '</ul>';
+    if (r.templateUsed){
+      h += '<div class="dim" style="font-family:var(--dnb-mono);font-size:10px">' +
+           'Item fields inherited from ' + esc(r.templateUsed) + '</div>';
+    }
     if (r.timing){
       h += '<div class="dim" style="font-family:var(--dnb-mono);font-size:10px;margin-top:4px">' +
            esc(r.timing) + '</div>';
@@ -3950,6 +4492,7 @@ var GNYDNB = (function(){
     \$('dnb-editBanner').classList.remove('open');
     \$('dnb-doorNote').textContent = DOOR_NOTE_NEW;
     \$('dnb-newOnlyRow').style.display = '';
+    setTemplatePickerEnabled(true, '');
 
     \$('dnb-number').value = '';
     \$('dnb-number').classList.remove('bad');
@@ -3977,12 +4520,11 @@ var GNYDNB = (function(){
       else if (card) card.style.display = '';
     }
 
-    seedFamily('DR');
-    seedFamily('F');
-    seedFamily('C');
-    if (INCLUDE_SCREEN_DEFAULT) seedFamily('S');
-    else { \$('dnb-compBody-S').innerHTML = ''; rowCount.S = 0;
-           \$('dnb-stepBody-S').innerHTML = ''; stepCount.S = 0; }
+    // Back to whatever the picker is on — the next door almost always wants
+    // the same template as the last one, so resetting to blank would just
+    // mean re-picking every time.
+    if (templateFill) applyTemplate(templateFill, false);
+    else seedAllFamilies();
 
     \$('dnb-submit').textContent = 'Create door';
     \$('dnb-submit').onclick = submit;
@@ -4012,10 +4554,15 @@ var GNYDNB = (function(){
     \$('dnb-submit').onclick = submit;
     setDefaultDate();
 
-    seedFamily('DR');
-    seedFamily('F');
-    seedFamily('C');
-    if (INCLUDE_SCREEN_DEFAULT){ \$('dnb-card-S').style.display = ''; seedFamily('S'); }
+    \$('dnb-template').innerHTML = templateOptionsHtml();
+    if (DEFAULT_TEMPLATE) \$('dnb-template').value = DEFAULT_TEMPLATE;
+    if (INCLUDE_SCREEN_DEFAULT) \$('dnb-card-S').style.display = '';
+
+    // The preselected template's payload rode down with the page, so the form
+    // arrives filled rather than empty-then-populated.
+    var boot = FILL_CACHE[\$('dnb-template').value];
+    if (boot){ templateFill = boot; applyTemplate(boot, false); }
+    else seedAllFamilies();
 
     if (NEXT_NUMBER){
       \$('dnb-number').value = NEXT_NUMBER;
@@ -4026,6 +4573,7 @@ var GNYDNB = (function(){
     refreshNumbers();
     updatePreview();
 
+    \$('dnb-template').addEventListener('change', onTemplateChange);
     \$('dnb-series').addEventListener('change', onSeriesChange);
     \$('dnb-class').addEventListener('change', markClassManual);
     \$('dnb-rev').addEventListener('change', function(){ refreshNumbers(); updatePreview(); });
@@ -4112,6 +4660,7 @@ var GNYDNB = (function(){
     opRevert: opRevert,
     doorAcPick: doorAcPick,
     loadDoor: loadDoor,
+    refill: refill,
     toggleScreen: toggleScreen,
     clearForm: clearForm,
     clearRecent: clearRecent,
