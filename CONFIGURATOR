@@ -120,6 +120,34 @@
  *   To change what new doors default to, edit the template family in
  *   NetSuite, not this script.
  *
+ * COPYING A DOOR — A RUN OF SIZES, OR BOTH SIDES OF THE RV
+ *   Doors come in sets. One RV takes ten of them at ten sizes, colour and
+ *   latch identical; or a left hand and a right hand of the same door for the
+ *   two sides. Building each from a template means re-picking every component
+ *   ten times to change one token in the description.
+ *
+ *   So: load a door, press "Copy to new door". The grids stay exactly as that
+ *   door has them, the number box takes the next free number, and the cursor
+ *   lands in the description selected. Change 32 X 78 to 30 X 78, or RH to LH,
+ *   and create. The form comes straight back with the SAME setup and the next
+ *   free number, so the second one is another two edits, and the tenth is too.
+ *
+ *   Two things separate a copy from a build off a template:
+ *     - Item fields are inherited from the SOURCE DOOR, not from a template.
+ *       A sibling built for the same RV is a far closer starting point than a
+ *       generic series template, which is the whole reason to copy.
+ *     - The reset after each create restores the copied door rather than the
+ *       picker's template, and each create updates the baseline description to
+ *       the one just used — so a climbing run of sizes is one edit per door.
+ *
+ *   A copy run ends when you pick a template, re-fill from one, or load
+ *   another door. Nothing else ends it.
+ *
+ *   The copy is a full build: four items, four BOMs, four revisions, three
+ *   routings, same rollback. Nothing on the source door is touched, and the
+ *   copy's own frame and core are re-derived from its new number rather than
+ *   pointing at the source's.
+ *
  * WHAT IS DELIBERATELY NOT HERE
  *   No weight, no shipping dimensions, no Order Tracking Sorter, no coated
  *   finish split — none of them are populated on any door item. Component
@@ -1138,6 +1166,31 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
     return listDoorTemplates().filter(t => normName(t.key) === k)[0] || null;
   }
 
+  // The four item IDs behind an existing door number, in the same shape
+  // findTemplate() returns. That shape is the point: it lets the build path
+  // inherit item fields from a real door exactly the way it inherits them
+  // from a template, and lets templateStamp() key a cache off it unchanged.
+  function resolveDoorItems(term) {
+    const parsed = parseDoorTerm(term);
+    if (!parsed || !parsed.series) return null;
+    const nums = familyNumbers(parsed.series, parsed.number);
+    const found = checkPartNumbers(ALL_FAMILIES.map(f => nums[f]));
+    const items = {};
+    for (const f of ALL_FAMILIES) {
+      const id = found[nums[f].toUpperCase()];
+      if (id) items[f] = String(id);
+    }
+    // No door item, no copy. The sub-assemblies alone are not a door.
+    if (!items.DR) return null;
+    return {
+      key: nums.DR,
+      series: parsed.series,
+      number: parsed.number,
+      items: items,
+      families: ALL_FAMILIES.filter(f => items[f])
+    };
+  }
+
   // Invalidates just the discovery list, so a template created a moment ago is
   // pickable now rather than in up to an hour. Cheaper and less disruptive
   // than the full ?refresh=1 sweep, which also dumps the work centers and
@@ -1742,28 +1795,44 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
         throw new Error('Template "' + p.templateKey + '" is no longer available. ' +
                         'Reload the page and pick again.');
       }
+
+      // Copying an existing door. Its own items are the right thing to inherit
+      // from: a second door for the same RV differs from its sibling in a size
+      // or a hinge hand and in nothing else, so the sibling is a far closer
+      // starting point than a generic series template. Resolved server-side
+      // from the number rather than trusted from the form, same as a template.
+      const src = p.sourceDoor ? resolveDoorItems(p.sourceDoor) : null;
+      if (p.sourceDoor && !src) {
+        throw new Error('Could not find ' + p.sourceDoor + ' to copy from. ' +
+                        'Load that door again and press Copy to new door.');
+      }
+
       const templateItems = {};
       for (const f of families.concat(['DR'])) {
-        templateItems[f] = (tpl && tpl.items[f]) ||
+        templateItems[f] = (src && src.items[f]) ||
+                           (tpl && tpl.items[f]) ||
                            (CFG.FALLBACK_TEMPLATE_ITEMS || {})[f] || '';
       }
-      // A template with no screen still needs SOMETHING for the screen's item
-      // fields. Its own frame is the right stand-in — every one of the 102
-      // live screens matches its frame field for field.
-      if (families.indexOf('S') !== -1 && !((tpl && tpl.items.S))) {
+      // A source or template with no screen still needs SOMETHING for the
+      // screen's item fields. Its own frame is the right stand-in — every one
+      // of the 102 live screens matches its frame field for field.
+      if (families.indexOf('S') !== -1 && !((src && src.items.S) || (tpl && tpl.items.S))) {
         templateItems.S = templateItems.F || templateItems.S;
       }
 
-      // Same stamp as the fill payload, so a template edited in NetSuite
-      // between builds does not hand the next door a stale field snapshot.
-      // Falls back to the plain key for the FALLBACK_TEMPLATE_ITEMS path,
-      // which has no template record to stamp against.
-      const tplStamp = tpl ? templateStamp(tpl) : '';
+      // Same stamp as the fill payload, so a source or template edited in
+      // NetSuite between builds does not hand the next door a stale field
+      // snapshot. templateStamp derives every record name from .key, and a
+      // door family is named on exactly the same pattern as a template one,
+      // so a source door stamps without any special casing.
+      const stampSubject = src || tpl;
+      const tplStamp = stampSubject ? templateStamp(stampSubject) : '';
       const defaults = {};
       for (const f of families.concat(['DR'])) {
         defaults[f] = getTemplateDefaultsById(templateItems[f], tplStamp);
       }
-      out.templateUsed = tpl ? tpl.key : null;
+      out.templateUsed = src ? src.key : (tpl ? tpl.key : null);
+      out.copiedFrom = src ? src.key : null;
       timer.mark('template');
 
       let subsidiaryId = CFG.SUBSIDIARY_ID;
@@ -2970,6 +3039,8 @@ ${hideTitle}
   color:var(--dnb-amber);border-color:#e0c060;background:#fffaf0}
 #${WRAP} .recent-tag.t-template{
   color:var(--dnb-blue);border-color:#a8c4e0;background:#eef4fa}
+#${WRAP} .recent-tag.t-copied{
+  color:var(--dnb-teal);border-color:#8ccfae;background:#eef8f2}
 #${WRAP} .recent.edited.t-template-row{border-left-color:var(--dnb-blue)}
 #${WRAP} .recent-time{font-family:var(--dnb-mono);font-size:9px;color:var(--dnb-dim);white-space:nowrap}
 #${WRAP} .recent-desc{font-size:10px;color:var(--dnb-muted);margin-top:2px;max-width:100%;
@@ -3249,6 +3320,8 @@ ${famCard('S', 5, 'Screen frame extrusion, mesh, hardware. Usually cut only.')}
 <div class="actions">
   <button type="button" class="btn-primary tabstop" id="dnb-submit" onclick="GNYDNB.submit()">Create door</button>
   <button type="button" class="btn-secondary tabstop" id="dnb-newRevBtn" style="display:none" onclick="GNYDNB.submitNewRev()">Save as new BOM revs</button>
+  <button type="button" class="btn-secondary tabstop" id="dnb-copyBtn" style="display:none" onclick="GNYDNB.startCopy()"
+    title="Build a NEW door family from this one — same components and routing, next free number">Copy to new door</button>
   <label class="inline-lbl">
     <input type="checkbox" class="chk" id="dnb-autoIssue" tabindex="-1">
     Auto-issue components
@@ -3652,6 +3725,9 @@ var GNYDNB = (function(){
   }
 
   function applyEditData(r){
+    // Opening a different door ends any copy run — the grids are about to be
+    // replaced by that door's, so the thing being copied no longer exists.
+    stopCopy();
     mode = 'edit';
     editData = r;
 
@@ -3746,6 +3822,7 @@ var GNYDNB = (function(){
     \$('dnb-submit').textContent = 'Update fields';
     \$('dnb-submit').onclick = submitUpdate;
     \$('dnb-newRevBtn').style.display = '';
+    \$('dnb-copyBtn').style.display = '';
 
     var warn = (r.warnings && r.warnings.length)
       ? ' \\u00B7 ' + r.warnings.join(' \\u00B7 ') : '';
@@ -3771,6 +3848,7 @@ var GNYDNB = (function(){
     \$('dnb-submit').textContent = 'Create door';
     \$('dnb-submit').onclick = submit;
     \$('dnb-newRevBtn').style.display = 'none';
+    \$('dnb-copyBtn').style.display = 'none';
     setTemplatePickerEnabled(true, '');
     for (var i=0;i<ALL_FAMILIES.length;i++){
       var revRow = \$('dnb-editRev-' + ALL_FAMILIES[i]);
@@ -4058,6 +4136,110 @@ var GNYDNB = (function(){
   // it takes to add an option here.
   var templateFill = null;    // fill payload for the currently selected template
 
+  // The door currently being copied, held in the SAME shape as a template fill
+  // payload so applyTemplate and fillFamily consume it without knowing the
+  // difference. Non-null means every create builds a new family off this door
+  // rather than off the picker's template, and the form comes back as this
+  // door after each one — which is what turns a run of ten sizes, or a
+  // left/right pair for both sides of the RV, into one pass.
+  var cloneSource = null;
+
+  // Snapshots the loaded door into that shape. editData already carries
+  // components with their item numbers and descriptions, and steps with their
+  // work centers and cost templates, because loadFamilyUnit reads the same
+  // fields loadTemplateFill does. So this is a reshape, not a second trip.
+  //
+  // DR components here are the LOOSE HARDWARE only — loadDoorForEdit already
+  // split the frame/core/screen lines off into subLines. That is exactly what
+  // is wanted: the copy's own sub-assemblies get re-derived from its new
+  // number, the same way a template's placeholder ones are stripped.
+  function cloneFillFromEdit(){
+    if (!editData) return null;
+    var out = {
+      ok: true,
+      key: editData.doorNumber,
+      series: editData.series,
+      classId: editData.classId || '',
+      // Templates load into edit mode like any other door family, so copying
+      // one into a real door is a fair move — but its description carries the
+      // TEMPLATE marker on the front and that must not ride onto a door
+      // anybody ships. Same strip the server does on the template fill path.
+      description: String(editData.description || '')
+                     .replace(/^\\s*TEMPLATE\\s*[-:]?\\s*/i, '').trim(),
+      cutDetails: editData.cutDetails || '',
+      hasScreen: !!editData.families.S,
+      families: {},
+      warnings: []
+    };
+    for (var i=0;i<ALL_FAMILIES.length;i++){
+      var f = ALL_FAMILIES[i], u = editData.families[f];
+      if (!u) continue;
+      out.families[f] = {
+        itemId: u.itemId,
+        partNumber: u.partNumber,
+        components: (u.components || []).slice(),
+        steps: (u.steps || []).slice()
+      };
+    }
+    return out;
+  }
+
+  function startCopy(){
+    if (mode !== 'edit' || !editData){
+      showError('Load a door first — Copy works on the door currently open.');
+      return;
+    }
+    var snap = cloneFillFromEdit();
+    if (!snap || !snap.families.DR){
+      showError('That door could not be read well enough to copy.');
+      return;
+    }
+
+    // exitEditMode leaves the grids alone on purpose, but it also resets the
+    // note and the picker, so everything cosmetic is set after it, not before.
+    cloneSource = snap;
+    exitEditMode('');
+
+    \$('dnb-screen').checked = !!snap.hasScreen;
+    toggleScreen();
+    classUserSet = false;
+    applyTemplate(snap, false);   // description, class, cut details, every grid
+
+    \$('dnb-number').value = '';
+    setHint('dnb-numberHint', '', '');
+    fetchNextNumber();
+
+    setHint('dnb-templateHint',
+      'Copying ' + snap.key + ' — pick a template to stop.', 'good');
+    updateCopyBanner();
+    // The description is the only thing that usually changes between copies,
+    // so land on it selected and ready to retype.
+    \$('dnb-desc').focus();
+    \$('dnb-desc').select();
+  }
+
+  // Picking a template, re-filling from one, or loading another door ends a
+  // copy run. Nothing else does, so a create rolls straight into the next size.
+  function stopCopy(){
+    if (!cloneSource) return;
+    cloneSource = null;
+    \$('dnb-editBanner').classList.remove('open');
+    \$('dnb-doorNote').textContent = DOOR_NOTE_NEW;
+  }
+
+  function updateCopyBanner(){
+    if (!cloneSource || mode !== 'new') return;
+    \$('dnb-doorNote').textContent = 'Copying ' + cloneSource.key +
+      ' — same components and routing, new number.';
+    \$('dnb-editBanner').textContent =
+      'Copying ' + cloneSource.key + '. Every create builds a NEW door family from these ' +
+      'grids, then hands back the next free number with the same setup still loaded, so a run ' +
+      'of sizes or a left/right pair goes back to back. Item fields are inherited from ' +
+      cloneSource.key + ' rather than from a template. Change the size or the hinge hand in ' +
+      'the description before each one. Pick a template to stop copying.';
+    \$('dnb-editBanner').classList.add('open');
+  }
+
   // What the LAST template put into the series, description and cut boxes.
   // Switching templates has to overwrite its own leftovers without eating
   // anything a person typed, and "is the box empty?" cannot tell those two
@@ -4119,6 +4301,7 @@ var GNYDNB = (function(){
   }
 
   function onTemplateChange(){
+    stopCopy();
     var t = selectedTemplate();
     if (!t){
       templateFill = null;
@@ -4145,6 +4328,7 @@ var GNYDNB = (function(){
         !window.confirm('Re-fill from the template? Component and routing rows will be replaced.')){
       return;
     }
+    stopCopy();
     var t = selectedTemplate();
     if (!t){ seedAllFamilies(); return; }
     fetchTemplate(t.key, function(fill){
@@ -4557,9 +4741,13 @@ var GNYDNB = (function(){
 
     var payload = {
       action: 'build',
-      // The server re-resolves this rather than trusting item IDs from the
-      // form, so a template renamed since page load fails loudly.
-      templateKey: \$('dnb-template').value || '',
+      // The server re-resolves both of these rather than trusting item IDs
+      // from the form, so a template renamed — or a source door deleted —
+      // since page load fails loudly instead of cloning something else.
+      // A copy inherits item fields from its source door, so the template key
+      // is deliberately dropped for the duration of a copy run.
+      templateKey: cloneSource ? '' : (\$('dnb-template').value || ''),
+      sourceDoor: cloneSource ? cloneSource.key : '',
       series: series,
       number: number,
       description: desc,
@@ -4662,6 +4850,12 @@ var GNYDNB = (function(){
   // ── results ─────────────────────────────────────────────────────────────
   function showSuccess(r){
     addRecent(r);
+
+    // Each copy becomes the baseline for the next one, so going 30 -> 32 -> 34
+    // is one edit each time rather than re-deriving from the original door.
+    if (cloneSource && r.copiedFrom && r.description){
+      cloneSource.description = r.description;
+    }
 
     var box = \$('dnb-result');
     var h = '<h3>' + esc(r.message) +
@@ -4795,7 +4989,7 @@ var GNYDNB = (function(){
     list.unshift({
       // A template is worth telling apart from a door at a glance — it is the
       // thing other doors get built from, not a door anyone will ship.
-      kind: r.asTemplate ? 'template' : 'built',
+      kind: r.asTemplate ? 'template' : (r.copiedFrom ? 'copied' : 'built'),
       part: dr.name,
       itemId: dr.item.id,
       desc: r.description || '',
@@ -4860,8 +5054,11 @@ var GNYDNB = (function(){
       var kind = r.kind || 'built';
       var tag = kind === 'revised' ? 'NEW REV'
               : kind === 'updated' ? 'UPDATED'
-              : kind === 'template' ? 'TEMPLATE' : 'BUILT';
-      h += '<div class="recent' + (kind === 'built' ? '' : ' edited') +
+              : kind === 'template' ? 'TEMPLATE'
+              : kind === 'copied' ? 'COPY' : 'BUILT';
+      // A copy CREATES records, so it belongs on the build side of the rail's
+      // colour split, not the edit side.
+      h += '<div class="recent' + ((kind === 'built' || kind === 'copied') ? '' : ' edited') +
              (markFirst && i === 0 ? ' fresh' : '') + '">' +
              '<div class="recent-top">' +
                '<span class="recent-part"><a href="/app/common/item/item.nl?id=' + r.itemId +
@@ -4939,7 +5136,9 @@ var GNYDNB = (function(){
     \$('dnb-cut').value = '';
     \$('dnb-rev').value = 'A';
     \$('dnb-autoIssue').checked = AUTO_ISSUE_DEFAULT;
-    \$('dnb-screen').checked = INCLUDE_SCREEN_DEFAULT;
+    // Mid-copy the source door decides whether there is a screen, not the
+    // account default — otherwise every copy of a screened door loses it.
+    \$('dnb-screen').checked = cloneSource ? !!cloneSource.hasScreen : INCLUDE_SCREEN_DEFAULT;
     classUserSet = false;
     onSeriesChange();
     setDefaultDate();
@@ -4953,14 +5152,15 @@ var GNYDNB = (function(){
       var revRow = \$('dnb-editRev-' + f);
       if (revRow) revRow.style.display = 'none';
       var card = \$('dnb-card-' + f);
-      if (card && f === 'S') card.style.display = INCLUDE_SCREEN_DEFAULT ? '' : 'none';
+      if (card && f === 'S') card.style.display = \$('dnb-screen').checked ? '' : 'none';
       else if (card) card.style.display = '';
     }
 
-    // Back to whatever the picker is on — the next door almost always wants
-    // the same template as the last one, so resetting to blank would just
-    // mean re-picking every time.
-    if (templateFill) applyTemplate(templateFill, false);
+    // A copy run outranks the picker. The whole point is a set of near
+    // identical doors, so the next form has to come back as the door being
+    // copied, not as whatever template happens to be selected behind it.
+    if (cloneSource) applyTemplate(cloneSource, false);
+    else if (templateFill) applyTemplate(templateFill, false);
     else seedAllFamilies();
 
     \$('dnb-submit').textContent = 'Create door';
@@ -4970,7 +5170,15 @@ var GNYDNB = (function(){
     fetchNextNumber();
     refreshNumbers();
     updatePreview();
-    \$('dnb-series').focus();
+    // Mid-copy the series and the grids are already right and the description
+    // is the one thing that changes, so land there instead of at the top.
+    if (cloneSource){
+      updateCopyBanner();
+      \$('dnb-desc').focus();
+      \$('dnb-desc').select();
+    } else {
+      \$('dnb-series').focus();
+    }
   }
 
   function reset(){ window.location.href = baseUrl(); }
@@ -5099,6 +5307,7 @@ var GNYDNB = (function(){
     opRevert: opRevert,
     doorAcPick: doorAcPick,
     loadDoor: loadDoor,
+    startCopy: startCopy,
     refill: refill,
     openNewTemplate: openNewTemplate,
     closeNewTemplate: closeNewTemplate,
