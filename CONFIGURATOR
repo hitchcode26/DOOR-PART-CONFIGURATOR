@@ -183,9 +183,14 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
     // change needed. SQL LIKE syntax: % is the wildcard.
     TEMPLATE_DOOR_PATTERN: 'DR-%TEMPLATE%',
 
-    // Selected when the page opens. Blank means "first one alphabetically".
-    // Set to '' and DEFAULT_TEMPLATE_NONE below to open with an empty form.
-    DEFAULT_TEMPLATE: 'DR-4000-TEMPLATE',
+    // Selected when the page opens.
+    //   ''            open on "— none —" with blank grids  (needs ALLOW_NO_TEMPLATE)
+    //   '*'           whichever template sorts first
+    //   'DR-6000-…'   that one by name
+    // Blank is the default because opening pre-filled with one series' parts
+    // is misleading when most doors are not that series — the grids look
+    // authoritative and are not. Pick a template and it fills in one click.
+    DEFAULT_TEMPLATE: '',
 
     // Whether the picker offers a "— none —" option at all. With it, you get
     // blank grids and the built-in catalog defaults instead of a template.
@@ -2798,15 +2803,28 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
                    '". The form will open empty — build a DR-…-TEMPLATE family to fix that.');
     }
 
-    // Preselect: the configured default if it exists, else the first found.
+    // Preselect, per CFG.DEFAULT_TEMPLATE. Blank means "— none —", which is
+    // only reachable when the picker offers it; with ALLOW_NO_TEMPLATE off
+    // there is no none option to land on, so the first template is the only
+    // honest answer.
     let defaultTemplate = '';
     if (templates.length) {
       const want = normName(CFG.DEFAULT_TEMPLATE);
-      const hit = want ? templates.filter(t => normName(t.key) === want)[0] : null;
-      defaultTemplate = hit ? hit.key : templates[0].key;
-      if (want && !hit) {
-        notices.push('CFG.DEFAULT_TEMPLATE "' + CFG.DEFAULT_TEMPLATE +
-                     '" was not found — opening with ' + defaultTemplate + ' instead.');
+      const noneIsAllowed = !!CFG.ALLOW_NO_TEMPLATE;
+      if (want === '*') {
+        defaultTemplate = templates[0].key;
+      } else if (want) {
+        const hit = templates.filter(t => normName(t.key) === want)[0];
+        if (hit) {
+          defaultTemplate = hit.key;
+        } else {
+          defaultTemplate = noneIsAllowed ? '' : templates[0].key;
+          notices.push('CFG.DEFAULT_TEMPLATE "' + CFG.DEFAULT_TEMPLATE +
+                       '" was not found — opening with ' +
+                       (defaultTemplate || 'a blank form') + ' instead.');
+        }
+      } else {
+        defaultTemplate = noneIsAllowed ? '' : templates[0].key;
       }
     }
 
@@ -2828,29 +2846,38 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
       for (const w of defaultFill.warnings) notices.push(w);
     }
 
-    let banner = '';
+    // Two very different kinds of message used to share one banner. Warnings
+    // are things the person needs to know before building, so they stay on top
+    // and open. The setup facts — which templates exist, how many work centers
+    // loaded, which location — are for whoever maintains this, and fold away
+    // at the foot of the form where they cannot crowd the fields.
+    let warnBanner = '';
+    let setupInfo = '';
     try {
       const parts = templates.map(t =>
         '<a href="' + NS_ITEM + t.items.DR + '" target="_blank">' + escHtml(t.key) + '</a>' +
         ' [' + t.families.join('/') + ']');
-      banner = '<div class="tpl">' +
-               (parts.length
-                 ? templates.length + ' template' + (templates.length === 1 ? '' : 's') +
-                   ': ' + parts.join(' &middot; ')
-                 : 'No templates found') +
-               ' &middot; location <b>' + escHtml(CFG.LOCATION_NAME) + '</b>' +
-               ' &middot; ' + wcRows.length + ' work centers, ' + ctRows.length + ' cost templates' +
-               (nextNum ? ' &middot; next number <b>' + escHtml(nextNum) + '</b>' : '') +
-               (_cacheCleared ? ' &middot; <b>caches refreshed</b>' : '') +
-               '</div>';
+      setupInfo =
+        '<details class="setup"' + (_cacheCleared ? ' open' : '') + '>' +
+        '<summary>Setup' + (_cacheCleared ? ' &middot; caches refreshed' : '') + '</summary>' +
+        '<div class="tpl">' +
+        (parts.length
+          ? templates.length + ' template' + (templates.length === 1 ? '' : 's') +
+            ': ' + parts.join(' &middot; ')
+          : 'No templates found') +
+        ' &middot; location <b>' + escHtml(CFG.LOCATION_NAME) + '</b>' +
+        ' &middot; ' + wcRows.length + ' work centers, ' + ctRows.length + ' cost templates' +
+        (nextNum ? ' &middot; next number <b>' + escHtml(nextNum) + '</b>' : '') +
+        (_cacheCleared ? ' &middot; <b>caches refreshed</b>' : '') +
+        '</div></details>';
     } catch (e) {
-      banner = '<div class="warn">Could not list the templates: ' + escHtml(e.message) + '</div>';
+      warnBanner = '<div class="warn">Could not list the templates: ' + escHtml(e.message) + '</div>';
     }
 
     if (notices.length) {
-      banner += '<div class="warn">' + notices.map(n => escHtml(n)).join('<br>') +
-                '<br><span class="dim">You can still build — affected dropdowns will just be empty.</span>' +
-                '</div>';
+      warnBanner += '<div class="warn">' + notices.map(n => escHtml(n)).join('<br>') +
+                    '<br><span class="dim">You can still build — affected dropdowns will just be empty.</span>' +
+                    '</div>';
     }
 
     const hideTitle = CFG.HIDE_NS_PAGE_TITLE ? '.uir-page-title{display:none}' : '';
@@ -2965,22 +2992,55 @@ ${hideTitle}
 #${WRAP} .sub-label{font-family:var(--dnb-mono);font-size:9px;text-transform:uppercase;
   letter-spacing:.1em;color:var(--dnb-muted);margin-bottom:5px}
 
-/* The template picker sits above everything else because it decides what
-   everything else starts as. */
-#${WRAP} .tpl-row{display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap;
-  padding:10px 12px;margin-bottom:12px;background:#eef4fa;border:1px solid #a8c4e0;
-  border-radius:5px}
-#${WRAP} .tpl-pick{flex:1 1 320px;min-width:0}
-#${WRAP} .tpl-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap;min-width:0}
-#${WRAP} .tpl-actions .hint{min-height:0}
+/* "Start from" — one row, no box. The picker still comes first because it
+   decides what the grids hold, but a bordered panel made it look like a form
+   of its own. */
+#${WRAP} .start-row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;
+  margin-bottom:14px;padding-bottom:12px;border-bottom:1px dashed var(--dnb-border)}
+#${WRAP} .start-row .start-lbl{margin:0;white-space:nowrap}
+#${WRAP} .start-row select{flex:1 1 240px;min-width:0;width:auto}
+#${WRAP} .start-row .hint{flex:1 1 100%;margin-top:0;min-height:0}
+#${WRAP} .btn-sm{padding:5px 10px;font-size:11px;white-space:nowrap}
 /* Folded away until asked for — it is a once-in-a-while action and should not
    compete with the picker it sits under. */
-#${WRAP} .tpl-new{display:none;padding:12px;margin:-4px 0 12px;background:#fff;
-  border:1px solid #a8c4e0;border-top:none;border-radius:0 0 5px 5px}
+#${WRAP} .tpl-new{display:none;padding:12px;margin:-6px 0 14px;background:#fff;
+  border:1px solid #a8c4e0;border-radius:5px}
 #${WRAP} .tpl-new.open{display:block}
 #${WRAP} .tpl-new-head{font-size:11px;color:var(--dnb-muted);margin-bottom:10px}
 #${WRAP} .tpl-new-actions{display:flex;gap:10px;margin-top:10px;flex-wrap:wrap}
-@media(max-width:620px){#${WRAP} .tpl-row{flex-direction:column;align-items:stretch}}
+
+/* Number · Series · Description. Fixed tracks for the two short fields and
+   the rest to the description, which is the long one. Two-up on a half
+   screen, with the description taking the full second line. */
+#${WRAP} .row-main{display:grid;grid-template-columns:150px 230px minmax(0,1fr);gap:12px}
+#${WRAP} .row-main > *{min-width:0}
+@media(max-width:760px){
+  #${WRAP} .row-main{grid-template-columns:1fr 1fr}
+  #${WRAP} .row-main .span2{grid-column:1 / -1}
+}
+
+#${WRAP} .cut-wrap{margin-top:10px}
+#${WRAP} .cut-wrap textarea{min-height:64px}
+#${WRAP} .cut-wrap label .dim{text-transform:none;letter-spacing:0;font-family:var(--dnb-font);font-size:10px}
+
+/* Everything that is right on its own for almost every door, folded. */
+#${WRAP} details.more{margin-top:12px;border-top:1px dashed var(--dnb-border);padding-top:8px}
+#${WRAP} details.more summary{cursor:pointer;list-style:none;display:flex;align-items:baseline;
+  gap:8px;flex-wrap:wrap;font-family:var(--dnb-mono);font-size:10px;text-transform:uppercase;
+  letter-spacing:.1em;color:var(--dnb-muted);user-select:none}
+#${WRAP} details.more summary::-webkit-details-marker{display:none}
+#${WRAP} details.more summary::before{content:'\\25B8';font-size:11px}
+#${WRAP} details.more[open] summary::before{content:'\\25BE'}
+#${WRAP} details.more summary .dim{text-transform:none;letter-spacing:0;
+  font-family:var(--dnb-font);font-size:11px}
+#${WRAP} .more-body{padding-top:12px}
+#${WRAP} .gauto{grid-template-columns:repeat(auto-fit,minmax(200px,1fr))}
+
+/* Setup facts, for whoever maintains this, at the foot and closed. */
+#${WRAP} details.setup{margin-top:4px}
+#${WRAP} details.setup summary{cursor:pointer;font-family:var(--dnb-mono);font-size:9px;
+  text-transform:uppercase;letter-spacing:.1em;color:var(--dnb-dim);user-select:none}
+#${WRAP} details.setup .tpl{margin:6px 0 0}
 /* The derived part number for each family, shown so the cascade is never a
    surprise — you type one number and four items come out. */
 #${WRAP} .fam-num{font-family:var(--dnb-mono);font-size:11px;color:var(--dnb-blue);
@@ -2989,10 +3049,10 @@ ${hideTitle}
 
 #${WRAP} .grid{display:grid;gap:12px}
 #${WRAP} .grid > *{min-width:0}
-#${WRAP} .g4{grid-template-columns:1fr 1fr 2fr 1fr}
 #${WRAP} .g3{grid-template-columns:repeat(3,1fr)}
 #${WRAP} .g2{grid-template-columns:1fr 1fr}
-@media(max-width:900px){#${WRAP} .g4,#${WRAP} .g3,#${WRAP} .g2{grid-template-columns:1fr}}
+@media(max-width:760px){#${WRAP} .g3{grid-template-columns:1fr 1fr}}
+@media(max-width:560px){#${WRAP} .g3,#${WRAP} .g2{grid-template-columns:1fr}}
 
 #${WRAP} label{display:block;font-family:var(--dnb-mono);font-size:9px;text-transform:uppercase;
   letter-spacing:.1em;color:var(--dnb-muted);margin-bottom:4px}
@@ -3055,6 +3115,7 @@ ${hideTitle}
 #${WRAP} input.bad,#${WRAP} select.bad{border-color:var(--dnb-red);background:#fff4f4}
 #${WRAP} .hint{font-family:var(--dnb-mono);font-size:10px;color:var(--dnb-dim);
   margin-top:4px;min-height:13px}
+#${WRAP} #dnb-descHint{min-height:0}
 #${WRAP} .hint.bad{color:var(--dnb-red)}
 #${WRAP} .hint.good{color:var(--dnb-teal)}
 
@@ -3119,6 +3180,11 @@ ${hideTitle}
 #${WRAP} .btn-secondary:hover{background:#eee}
 #${WRAP} .btn-secondary:disabled{background:#eee;color:#999;cursor:not-allowed}
 
+#${WRAP} .edit-actions{display:none;gap:12px;align-items:center;flex-wrap:wrap;
+  padding:8px 12px;margin-top:10px;background:#fffaf0;border:1px solid #e0c060;
+  border-radius:5px}
+#${WRAP} .edit-actions.open{display:flex}
+#${WRAP} .edit-actions .hint{margin-top:0;color:var(--dnb-amber);min-height:0}
 #${WRAP} .edit-banner{background:#eef4fa;border:1px solid #a8c4e0;border-radius:5px;
   padding:8px 14px;color:#2a4a68;margin-bottom:14px;font-family:var(--dnb-mono);font-size:10px;
   display:none}
@@ -3168,7 +3234,7 @@ ${hideTitle}
 }
 </style>
 
-${banner}
+${warnBanner}
 <div class="dnb-layout">
 <div class="dnb-main">
 
@@ -3178,20 +3244,19 @@ ${banner}
 <div class="card">
   <div class="card-head">
     <span class="card-title">1 &nbsp;Door</span>
-    <span class="card-note" id="dnb-doorNote">Pick a series and take the next number, or type an existing door number to load it.</span>
+    <span class="card-note" id="dnb-doorNote">A new number builds a door; an existing one loads it to edit or copy.</span>
   </div>
   <div class="card-body">
-    <div class="tpl-row">
-      <div class="tpl-pick">
-        <label for="dnb-template">Build from template</label>
-        <select id="dnb-template" class="tabstop"></select>
-      </div>
-      <div class="tpl-actions">
-        <button type="button" id="dnb-refillBtn" onclick="GNYDNB.refill()"
-          title="Re-read this template from NetSuite, ignoring every cache, and replace the grids below">Re-fill from template</button>
-        <button type="button" id="dnb-newTplBtn" onclick="GNYDNB.openNewTemplate()">+ New template</button>
-        <span class="hint" id="dnb-templateHint" style="margin-top:0">&nbsp;</span>
-      </div>
+    <!-- One lean row. The picker decides what the grids start as, so it stays
+         first, but it does not need a box of its own to say so. -->
+    <div class="start-row">
+      <label for="dnb-template" class="start-lbl">Start from</label>
+      <select id="dnb-template" class="tabstop"></select>
+      <button type="button" class="btn-sm" id="dnb-refillBtn" onclick="GNYDNB.refill()"
+        title="Re-read this template from NetSuite, ignoring every cache, and replace the grids below">Re-fill</button>
+      <button type="button" class="btn-sm" id="dnb-newTplBtn" onclick="GNYDNB.openNewTemplate()"
+        title="Save everything on the form as a reusable template">+ New template</button>
+      <span class="hint" id="dnb-templateHint">&nbsp;</span>
     </div>
 
     <div class="tpl-new" id="dnb-newTplPanel">
@@ -3220,60 +3285,90 @@ ${banner}
       </div>
     </div>
 
-    <div class="grid g4">
-      <div>
-        <label for="dnb-series">Series</label>
-        <select id="dnb-series" class="tabstop">${seriesOptions}</select>
-      </div>
+    <!-- The three things every door needs, and nothing else on the main path.
+         Number first: it is the entry point for BOTH flows — a new number
+         builds, an old one loads for editing or copying. -->
+    <div class="row-main">
       <div>
         <label for="dnb-number">Door number</label>
         <div class="ac-wrap">
-          <input id="dnb-number" class="tabstop" autocomplete="off">
+          <input id="dnb-number" class="tabstop" autocomplete="off" placeholder="new or existing">
           <div class="ac-list" id="dnb-doorAc"></div>
         </div>
         <div class="hint" id="dnb-numberHint">&nbsp;</div>
       </div>
       <div>
+        <label for="dnb-series">Series</label>
+        <select id="dnb-series" class="tabstop">${seriesOptions}</select>
+      </div>
+      <div class="span2">
         <label for="dnb-desc">Description</label>
-        <input id="dnb-desc" class="tabstop" autocomplete="off">
+        <input id="dnb-desc" class="tabstop" autocomplete="off"
+          placeholder="ENT SQ SD RH WB 32 X 78 ML 805 950 …  (series is added for you)">
         <div class="hint" id="dnb-descHint">&nbsp;</div>
       </div>
-      <div>
-        <label for="dnb-class">Class</label>
-        <select id="dnb-class"${skipTab}></select>
-        <div class="hint" id="dnb-classHint">&nbsp;</div>
-      </div>
     </div>
 
-    <div class="grid g3" style="margin-top:4px" id="dnb-newOnlyRow">
-      <div>
-        <label for="dnb-rev">Revision</label>
-        <select id="dnb-rev"${skipTab}></select>
-      </div>
-      <div>
-        <label for="dnb-date">Revision effective date</label>
-        <input id="dnb-date" autocomplete="off"${skipTab}>
-      </div>
-      <div>
-        <label>&nbsp;</label>
-        <label class="inline-lbl">
-          <input type="checkbox" class="chk" id="dnb-screen" onchange="GNYDNB.toggleScreen()">
-          Include screen door
-        </label>
-      </div>
+    <!-- Edit-mode only, and deliberately RIGHT HERE rather than down with the
+         create actions: you get here by typing an old number into the box
+         immediately above, so the copy has to be within reach of where your
+         eyes already are. -->
+    <div class="edit-actions" id="dnb-editActions">
+      <button type="button" class="btn-secondary" id="dnb-copyBtn" onclick="GNYDNB.startCopy()"
+        title="Build a NEW door family from this one — same components and routing, next free number">Copy to new door</button>
+      <span class="hint" id="dnb-copyHint">&nbsp;</span>
     </div>
 
-    <div class="grid g2" style="margin-top:10px">
-      <div>
-        <label for="dnb-cut">Cut details</label>
-        <textarea id="dnb-cut" tabindex="-1" placeholder="(Outer W - )&#10;(Outer H - )&#10;(Inner W - )&#10;(Inner H - )&#10;(Panel W - )&#10;(Panel H - )&#10;(H-Bar - )"></textarea>
-        <div class="hint">Door only. Left blank on the frame, core and screen.</div>
-      </div>
-      <div>
-        <label for="dnb-preview-box">What gets built</label>
-        <div class="preview" id="dnb-preview-box" style="background:#fff;border:1px solid var(--dnb-border);border-radius:4px;padding:8px 10px;min-height:96px"></div>
-      </div>
+    <!-- The cut list changes with every size, so it stays in view. Three rows
+         is enough to see it is there and to fix a dimension; it grows if you
+         drag it. -->
+    <div class="cut-wrap">
+      <label for="dnb-cut">Cut details <span class="dim">— door only</span></label>
+      <textarea id="dnb-cut" rows="3" tabindex="-1" placeholder="(Outer W - )&#10;(Outer H - )&#10;(Inner W - )&#10;(Inner H - )&#10;(Panel W - )&#10;(Panel H - )&#10;(H-Bar - )"></textarea>
     </div>
+
+    <!-- Everything below is set correctly on its own for nearly every door:
+         class from the series, revision A, effective date yesterday, no
+         screen, auto-issue on. It is here for the exceptions, folded away so
+         it does not compete with the fields that actually vary. -->
+    <details class="more" id="dnb-more">
+      <summary>More options
+        <span class="dim">class · revision · effective date · screen door · auto-issue</span>
+      </summary>
+      <div class="more-body">
+        <div class="grid gauto">
+          <div>
+            <label for="dnb-class">Class</label>
+            <select id="dnb-class"${skipTab}></select>
+            <div class="hint" id="dnb-classHint">&nbsp;</div>
+          </div>
+          <div>
+            <label>&nbsp;</label>
+            <label class="inline-lbl">
+              <input type="checkbox" class="chk" id="dnb-autoIssue" tabindex="-1">
+              Auto-issue components
+            </label>
+          </div>
+        </div>
+        <div class="grid gauto" style="margin-top:10px" id="dnb-newOnlyRow">
+          <div>
+            <label for="dnb-rev">Revision</label>
+            <select id="dnb-rev"${skipTab}></select>
+          </div>
+          <div>
+            <label for="dnb-date">Revision effective date</label>
+            <input id="dnb-date" autocomplete="off"${skipTab}>
+          </div>
+          <div>
+            <label>&nbsp;</label>
+            <label class="inline-lbl">
+              <input type="checkbox" class="chk" id="dnb-screen" onchange="GNYDNB.toggleScreen()">
+              Include screen door
+            </label>
+          </div>
+        </div>
+      </div>
+    </details>
   </div>
 </div>
 
@@ -3320,14 +3415,11 @@ ${famCard('S', 5, 'Screen frame extrusion, mesh, hardware. Usually cut only.')}
 <div class="actions">
   <button type="button" class="btn-primary tabstop" id="dnb-submit" onclick="GNYDNB.submit()">Create door</button>
   <button type="button" class="btn-secondary tabstop" id="dnb-newRevBtn" style="display:none" onclick="GNYDNB.submitNewRev()">Save as new BOM revs</button>
-  <button type="button" class="btn-secondary tabstop" id="dnb-copyBtn" style="display:none" onclick="GNYDNB.startCopy()"
-    title="Build a NEW door family from this one — same components and routing, next free number">Copy to new door</button>
-  <label class="inline-lbl">
-    <input type="checkbox" class="chk" id="dnb-autoIssue" tabindex="-1">
-    Auto-issue components
-  </label>
+
   <div class="preview" id="dnb-preview"></div>
 </div>
+
+${setupInfo}
 </div>
 
 <aside class="dnb-side">
@@ -3390,7 +3482,7 @@ var GNYDNB = (function(){
   var SUB_FAMILIES = ['F', 'C', 'S'];
   var ALL_FAMILIES = ['DR', 'F', 'C', 'S'];
   var DOOR_NOTE_NEW =
-    'Pick a series and take the next number, or type an existing door number to load it.';
+    'A new number builds a door; an existing one loads it to edit or copy.';
 
   var root;
   var rowCount = { DR:0, F:0, C:0, S:0 };
@@ -3822,7 +3914,9 @@ var GNYDNB = (function(){
     \$('dnb-submit').textContent = 'Update fields';
     \$('dnb-submit').onclick = submitUpdate;
     \$('dnb-newRevBtn').style.display = '';
-    \$('dnb-copyBtn').style.display = '';
+    \$('dnb-editActions').classList.add('open');
+    setHint('dnb-copyHint', 'Copy builds a new door family from ' + r.doorNumber +
+      ' on the next free number. Nothing here is touched.', '');
 
     var warn = (r.warnings && r.warnings.length)
       ? ' \\u00B7 ' + r.warnings.join(' \\u00B7 ') : '';
@@ -3848,7 +3942,7 @@ var GNYDNB = (function(){
     \$('dnb-submit').textContent = 'Create door';
     \$('dnb-submit').onclick = submit;
     \$('dnb-newRevBtn').style.display = 'none';
-    \$('dnb-copyBtn').style.display = 'none';
+    \$('dnb-editActions').classList.remove('open');
     setTemplatePickerEnabled(true, '');
     for (var i=0;i<ALL_FAMILIES.length;i++){
       var revRow = \$('dnb-editRev-' + ALL_FAMILIES[i]);
@@ -4525,40 +4619,26 @@ var GNYDNB = (function(){
   }
 
   // ── preview ─────────────────────────────────────────────────────────────
+  // One line next to the Create button. The per-family part numbers, BOM and
+  // revision names are already printed at the top of each family card, so a
+  // second list of them up here was saying the same thing twice.
   function updatePreview(){
-    var box = \$('dnb-preview-box');
     var line = \$('dnb-preview');
+    if (!line) return;
 
     if (mode === 'edit' && editData){
-      var fams = ALL_FAMILIES.filter(function(f){ return editData.families[f]; });
-      box.innerHTML = fams.map(function(f){
-        var u = editData.families[f];
-        return '<b>' + esc(u.partNumber) + '</b> &middot; ' + esc(u.revName || 'no revision') +
-               (u.routingId ? ' &middot; routing' : '');
-      }).join('<br>');
       line.innerHTML = 'Editing <b>' + esc(editData.doorNumber) + '</b>';
       return;
     }
 
     var s = \$('dnb-series').value, n = \$('dnb-number').value.trim();
-    if (!s || !n){
-      box.innerHTML = '<span class="dim">Pick a series and a number.</span>';
-      line.innerHTML = '';
-      return;
-    }
+    if (!s || !n){ line.innerHTML = ''; return; }
 
-    var subs = activeFamilies();
-    var all = subs.concat(['DR']);
-    var records = 0, h = '';
-    for (var i=0;i<all.length;i++){
-      var f = all[i], pn = partNumberFor(f);
-      records += 3 + (BUILDS_ROUTING[f] ? 1 : 0);
-      h += '<b>' + esc(pn) + '</b> &middot; BOM &middot; ' + esc(\$('dnb-rev').value) +
-           (BUILDS_ROUTING[f] ? ' &middot; routing' : ' &middot; <span class="dim">no routing</span>') +
-           '<br>';
-    }
-    box.innerHTML = h;
-    line.innerHTML = records + ' records across ' + all.length + ' items';
+    var all = activeFamilies().concat(['DR']);
+    var records = 0;
+    for (var i=0;i<all.length;i++) records += 3 + (BUILDS_ROUTING[all[i]] ? 1 : 0);
+    line.innerHTML = 'Creates <b>' + esc(partNumberFor('DR')) + '</b> &middot; ' +
+                     records + ' records across ' + all.length + ' items';
   }
 
   // ── payload ─────────────────────────────────────────────────────────────
@@ -5166,6 +5246,7 @@ var GNYDNB = (function(){
     \$('dnb-submit').textContent = 'Create door';
     \$('dnb-submit').onclick = submit;
     \$('dnb-newRevBtn').style.display = 'none';
+    \$('dnb-editActions').classList.remove('open');
 
     fetchNextNumber();
     refreshNumbers();
@@ -5200,7 +5281,11 @@ var GNYDNB = (function(){
     setDefaultDate();
 
     \$('dnb-template').innerHTML = templateOptionsHtml();
+    // No default means the picker sits on "— none —", which is option zero,
+    // so there is nothing to assign.
     if (DEFAULT_TEMPLATE) \$('dnb-template').value = DEFAULT_TEMPLATE;
+    else setHint('dnb-templateHint',
+      'Blank form — pick a template to fill the grids.', '');
     if (!ALLOW_TEMPLATE_CREATION) \$('dnb-newTplBtn').style.display = 'none';
     if (INCLUDE_SCREEN_DEFAULT) \$('dnb-card-S').style.display = '';
 
