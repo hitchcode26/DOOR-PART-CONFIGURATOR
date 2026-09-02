@@ -86,6 +86,17 @@
  *   prefix. Reload with ?refresh=1 if you built one in the last hour and
  *   don't want to wait out the cache.
  *
+ *   EDITING A TEMPLATE IN NETSUITE IS PICKED UP ON THE NEXT PAGE LOAD.
+ *   The template fill payload and the item-field snapshot are cached for 30
+ *   minutes, so for a long time the honest answer to "I changed the template
+ *   and the tool didn't notice" was "reload with ?refresh=1". It no longer
+ *   is. Both caches are now keyed by a freshness stamp read off the live
+ *   records — see templateStamp() — so any edit to a template's items, BOM
+ *   revisions, components or routing steps changes the key and the next load
+ *   misses the cache and re-reads. Costs one extra query per template load.
+ *   "Re-fill from template" goes further and bypasses every cache, client and
+ *   server, which is the override when you don't trust the stamp.
+ *
  *   AND YOU CAN MAKE THEM FROM HERE. "+ New template" builds a template
  *   family out of whatever is currently on the form — same four records per
  *   family as a real door, just named DR-{series}-TEMPLATE instead of
@@ -98,8 +109,8 @@
  *
  *   Templates are ordinary door families, so they load into edit mode like
  *   anything else — type DR-4000-TEMPLATE in the number box to adjust one.
- *   They are excluded from the next-number counter (that only counts numeric
- *   tails), so making one never burns a door number.
+ *   They are excluded from the next-door-number counter (that only counts
+ *   numeric tails), so making one never burns a door number.
  *
  *   A template need not have all four families. DR-4000-TEMPLATE has no
  *   screen, so ticking "include screen door" on it falls back to the built-in
@@ -240,6 +251,14 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
     CACHE_TTL_TEMPLATE: 1800,
 
     CACHE_KEYS: ['workcenters', 'costtemplates', 'classes', 'templates'],
+
+    // Template caches are keyed by a freshness stamp read off the live
+    // records. Edit a template in NetSuite and the stamp moves, so the next
+    // page load misses the cache and re-reads it instead of serving up to
+    // CACHE_TTL_TEMPLATE seconds of stale components and routing. Costs one
+    // extra query per template load. Set false to go back to plain TTL
+    // caching, where ?refresh=1 is the only way to pick up an outside edit.
+    STAMP_TEMPLATE_CACHE: true,
 
     // Sourcing re-derives dependent fields on save. Every field a new door
     // needs is copied explicitly off its template, so sourcing mostly redoes
@@ -513,6 +532,13 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
       // Every template's field snapshot and fill payload, including ones added
       // since this script was written — which is the whole point of the
       // refresh escape hatch.
+      //
+      // With STAMP_TEMPLATE_CACHE on these keys carry a stamp suffix, so the
+      // unstamped names below will not match the live entries. That is fine
+      // and deliberate: a stamped entry is only reachable while the records it
+      // was read from are unchanged, so the moment it goes stale it is
+      // unreachable anyway and expires on its own TTL. The unstamped removals
+      // stay for accounts running with the stamp turned off.
       let known = [];
       try { known = listDoorTemplates(true) || []; } catch (e) { known = []; }
       for (const t of known) {
@@ -617,7 +643,9 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
       if (api === 'costtemplates') return listCostTemplates();
       if (api === 'classes')       return listClasses();
       if (api === 'templates')     return listDoorTemplates();
-      if (api === 'template')      return loadTemplateFill(params.term || '');
+      // fresh=1 is "Re-fill from template" — skip the server cache entirely
+      // and read the template's live BOM and routing.
+      if (api === 'template')      return loadTemplateFill(params.term || '', params.fresh === '1');
       if (api === 'nextnumber')    return { number: nextDoorNumber() };
       if (api === 'checkdoor')     return checkDoorNumber(params.term || '');
       if (api === 'loaddoor')      return loadDoorForEdit(params.term || '');
@@ -1125,16 +1153,96 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
     }
   }
 
+  // A short string that moves whenever anything loadTemplateFill reads has
+  // changed. Folded into the cache key, so editing a template in NetSuite
+  // invalidates it rather than waiting out CACHE_TTL_TEMPLATE. This is the
+  // whole answer to "I updated the template outside the tool and the tool
+  // didn't notice."
+  //
+  // Everything is reached BY NAME, not by internal ID, because the item -> BOM
+  // link is not exposed to SuiteQL — it lives on the item's own sublist. The
+  // builder names every record it creates off the part number ("{part} BOM",
+  // "{part} ROUTING"), so all the names derive from the template key alone and
+  // this stays ONE query rather than four record loads.
+  //
+  // The four parts:
+  //   I  newest lastmodifieddate across the family's items       (field edits)
+  //   R  newest lastmodifieddate across their BOM revisions      (component edits)
+  //   N  total component line count across those revisions       (adds/deletes)
+  //   S  aggregate fingerprint of the routing steps              (routing edits)
+  //
+  // S has to be a fingerprint because ManufacturingRouting carries NO
+  // lastmodifieddate column in this account — selecting it errors outright.
+  // Count plus the sums of sequence, work center, cost template, run rate,
+  // setup and operation-name length moves on any real edit. The one thing it
+  // cannot see is an operation renamed to a different name of the same length
+  // with nothing else changed; "Re-fill from template" covers that.
+  //
+  // A failure here returns '' — the plain unstamped key, which is the OLD
+  // behaviour. Stale, not broken. Never fail a page load over a cache tweak.
+  function templateStamp(tpl) {
+    if (!CFG.USE_CACHE || !CFG.STAMP_TEMPLATE_CACHE || !tpl) return '';
+    const tail = String(tpl.key).slice(CFG.FAMILY_PREFIX.DR.length);
+    const items = [], boms = [], routings = [];
+    for (const f of ALL_FAMILIES) {
+      const pn = sq(CFG.FAMILY_PREFIX[f] + tail).toUpperCase();
+      items.push("'" + pn + "'");
+      boms.push("'" + pn + " BOM'");
+      routings.push("'" + pn + " ROUTING'");
+    }
+    const inItems = items.join(','), inBoms = boms.join(','), inRt = routings.join(',');
+    try {
+      const rows = query.runSuiteQL({
+        query:
+          `SELECT 'I' AS k, TO_CHAR(MAX(lastmodifieddate),'YYYYMMDDHH24MISS') AS v
+             FROM item WHERE UPPER(itemid) IN (${inItems})
+           UNION ALL
+           SELECT 'R', TO_CHAR(MAX(r.lastmodifieddate),'YYYYMMDDHH24MISS')
+             FROM bomrevision r JOIN bom b ON b.id = r.billofmaterials
+            WHERE UPPER(b.name) IN (${inBoms})
+           UNION ALL
+           SELECT 'N', TO_CHAR(COUNT(*))
+             FROM bomrevisioncomponent c
+             JOIN bomrevision r2 ON r2.id = c.bomrevision
+             JOIN bom b2 ON b2.id = r2.billofmaterials
+            WHERE UPPER(b2.name) IN (${inBoms})
+           UNION ALL
+           SELECT 'S', TO_CHAR(COUNT(*))
+             || '.' || TO_CHAR(SUM(s.operationsequence))
+             || '.' || TO_CHAR(SUM(NVL(s.manufacturingworkcenter,0)))
+             || '.' || TO_CHAR(SUM(NVL(s.manufacturingcosttemplate,0)))
+             || '.' || TO_CHAR(SUM(NVL(s.runrate,0)))
+             || '.' || TO_CHAR(SUM(NVL(s.setuptime,0)))
+             || '.' || TO_CHAR(SUM(LENGTH(NVL(s.operationname,'x'))))
+             FROM ManufacturingRoutingRoutingStep s
+             JOIN ManufacturingRouting rt ON rt.id = s.manufacturingrouting
+            WHERE UPPER(rt.name) IN (${inRt})`
+      }).asMappedResults();
+
+      const by = {};
+      for (const r of rows) by[r.k] = (r.v == null) ? '' : String(r.v);
+      // Cache keys are not a free-form string — keep it to characters that
+      // are safe everywhere.
+      return ['I', 'R', 'N', 'S'].map(k => by[k] || '0').join('_')
+                                 .replace(/[^A-Za-z0-9._]/g, '');
+    } catch (e) {
+      log.audit({ title: 'templateStamp failed for ' + tpl.key, details: e.toString() });
+      return '';
+    }
+  }
+
   // Everything the form needs to fill itself from a template: per family, the
   // component lines with their quantities and sources, and the routing steps
   // with their work centers and cost templates. Read off the template's live
   // BOM and routing, so editing the template in NetSuite is how you change
   // what new doors start as.
-  function loadTemplateFill(key) {
+  //
+  // skipCache is "Re-fill from template" — read NetSuite, ignore every cache.
+  function loadTemplateFill(key, skipCache) {
     const tpl = findTemplate(key);
     if (!tpl) return { ok: false, message: 'Template "' + key + '" was not found.' };
 
-    return cached('tplfill_' + tpl.key, CFG.CACHE_TTL_TEMPLATE, () => {
+    const produce = () => {
       const out = {
         ok: true,
         key: tpl.key,
@@ -1198,7 +1306,15 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
         }
       }
       return out;
-    });
+    };
+
+    // No stamp query at all on a forced re-read — it would only be used to
+    // build a key nobody is going to look at.
+    if (skipCache) return produce();
+
+    const stamp = templateStamp(tpl);
+    return cached('tplfill_' + tpl.key + (stamp ? '_' + stamp : ''),
+                  CFG.CACHE_TTL_TEMPLATE, produce);
   }
 
   function templateNameFor(tpl, family) {
@@ -1638,9 +1754,14 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
         templateItems.S = templateItems.F || templateItems.S;
       }
 
+      // Same stamp as the fill payload, so a template edited in NetSuite
+      // between builds does not hand the next door a stale field snapshot.
+      // Falls back to the plain key for the FALLBACK_TEMPLATE_ITEMS path,
+      // which has no template record to stamp against.
+      const tplStamp = tpl ? templateStamp(tpl) : '';
       const defaults = {};
       for (const f of families.concat(['DR'])) {
-        defaults[f] = getTemplateDefaultsById(templateItems[f]);
+        defaults[f] = getTemplateDefaultsById(templateItems[f], tplStamp);
       }
       out.templateUsed = tpl ? tpl.key : null;
       timer.mark('template');
@@ -2439,10 +2560,16 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
 
   // ─── TEMPLATE ITEM DEFAULTS ───────────────────────────────────────────────
   let _defaultsCache = {};
-  function getTemplateDefaultsById(id) {
+
+  // `stamp` comes from templateStamp() and is folded into the cache key, so an
+  // item field changed on the template in NetSuite is picked up on the next
+  // build instead of at the end of CACHE_TTL_TEMPLATE. Blank stamp = plain
+  // key = old TTL-only behaviour.
+  function getTemplateDefaultsById(id, stamp) {
     if (!id) return { _fields: {}, subsidiary: '', name: '' };
     if (_defaultsCache[id]) return _defaultsCache[id];
-    _defaultsCache[id] = cached('tpl_' + id, CFG.CACHE_TTL_TEMPLATE, () => readTemplateDefaults(id));
+    _defaultsCache[id] = cached('tpl_' + id + (stamp ? '_' + stamp : ''),
+                                CFG.CACHE_TTL_TEMPLATE, () => readTemplateDefaults(id));
     return _defaultsCache[id];
   }
 
@@ -2615,7 +2742,8 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
     }
 
     // Fill payload for the preselected template, embedded so the form arrives
-    // already filled instead of flashing empty and then populating.
+    // already filled instead of flashing empty and then populating. Stamped,
+    // so an outside edit to that template shows up here on this load.
     let defaultFill = null;
     if (defaultTemplate) {
       try {
@@ -2988,7 +3116,8 @@ ${banner}
         <select id="dnb-template" class="tabstop"></select>
       </div>
       <div class="tpl-actions">
-        <button type="button" id="dnb-refillBtn" onclick="GNYDNB.refill()">Re-fill from template</button>
+        <button type="button" id="dnb-refillBtn" onclick="GNYDNB.refill()"
+          title="Re-read this template from NetSuite, ignoring every cache, and replace the grids below">Re-fill from template</button>
         <button type="button" id="dnb-newTplBtn" onclick="GNYDNB.openNewTemplate()">+ New template</button>
         <span class="hint" id="dnb-templateHint" style="margin-top:0">&nbsp;</span>
       </div>
@@ -3160,6 +3289,7 @@ var GNYDNB = (function(){
   var SEED_CUT = ${CFG.SEED_CUT_DETAILS_FROM_TEMPLATE ? 'true' : 'false'};
   // The preselected template's fill payload, embedded so the form arrives
   // already populated rather than flashing empty and filling a beat later.
+  // It came off a stamped server cache, so it is current as of this page load.
   var FILL_CACHE = ${defaultFill ? '{' + JSON.stringify(defaultTemplate) + ': ' + JSON.stringify(defaultFill) + '}' : '{}'};
   var OPERATIONS = ${JSON.stringify(OPERATIONS)};
   var DEFAULT_STEPS = ${JSON.stringify(DEFAULT_STEPS)};
@@ -3229,7 +3359,7 @@ var GNYDNB = (function(){
     var p = new URLSearchParams(window.location.search);
     // refresh is a one-shot page-load flag; carrying it on every XHR would
     // clear the caches over and over and make the tool slower, not faster.
-    p.delete('api'); p.delete('term'); p.delete('refresh');
+    p.delete('api'); p.delete('term'); p.delete('refresh'); p.delete('fresh');
     return window.location.origin + window.location.pathname + '?' + p.toString();
   }
 
@@ -3983,7 +4113,9 @@ var GNYDNB = (function(){
   }
 
   // Explicit "Re-fill" — the escape hatch for when you've edited the grids
-  // and want to start over without losing the number or description.
+  // and want to start over without losing the number or description. It is
+  // ALSO the override for a template edited in NetSuite: it forces a live
+  // re-read, past the page's FILL_CACHE and past the server cache.
   function refill(){
     if (mode === 'edit'){
       setHint('dnb-templateHint', 'Templates do not apply while editing an existing door.', 'bad');
@@ -3998,14 +4130,18 @@ var GNYDNB = (function(){
     fetchTemplate(t.key, function(fill){
       templateFill = fill;
       applyTemplate(fill, false);   // false = overwrite description/cut too
-    });
+    }, true);                        // true = ignore every cache, re-read NetSuite
   }
 
-  function fetchTemplate(key, done){
-    if (FILL_CACHE[key]){ done(FILL_CACHE[key]); return; }
-    setHint('dnb-templateHint', 'Loading ' + key + '…', '');
+  // force = skip the in-page cache AND tell the server to skip its own, so
+  // what lands in the grids is what is in NetSuite right now.
+  function fetchTemplate(key, done, force){
+    if (!force && FILL_CACHE[key]){ done(FILL_CACHE[key]); return; }
+    if (force) delete FILL_CACHE[key];
+    setHint('dnb-templateHint', (force ? 'Re-reading ' : 'Loading ') + key + '…', '');
     var xhr = new XMLHttpRequest();
-    xhr.open('GET', baseUrl() + '&api=template&term=' + encodeURIComponent(key), true);
+    xhr.open('GET', baseUrl() + '&api=template&term=' + encodeURIComponent(key) +
+             (force ? '&fresh=1' : ''), true);
     xhr.onload = function(){
       try {
         var t = xhr.responseText, s = t.indexOf('{'), e = t.lastIndexOf('}');
