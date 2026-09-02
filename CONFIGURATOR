@@ -4058,6 +4058,26 @@ var GNYDNB = (function(){
   // it takes to add an option here.
   var templateFill = null;    // fill payload for the currently selected template
 
+  // What the LAST template put into the series, description and cut boxes.
+  // Switching templates has to overwrite its own leftovers without eating
+  // anything a person typed, and "is the box empty?" cannot tell those two
+  // apart — on page load the boot template fills all three, so an emptiness
+  // test says "occupied, leave it" and the next template you pick silently
+  // keeps the old one's description and series. Remembering what was seeded
+  // is what distinguishes them.
+  var seededDesc = null;
+  var seededCut = null;
+  var seededSeries = null;
+
+  // A field is still the template's to overwrite when it is empty, or when it
+  // holds exactly what the last template put there. The moment someone edits
+  // it, it becomes theirs and only an explicit Re-fill takes it back.
+  function templateOwned(el, seeded){
+    if (!el) return false;
+    var v = String(el.value == null ? '' : el.value).trim();
+    return !v || (seeded !== null && v === String(seeded).trim());
+  }
+
   function templateOptionsHtml(){
     var h = ALLOW_NO_TEMPLATE ? '<option value="">— none (blank form) —</option>' : '';
     for (var i=0;i<TEMPLATES.length;i++){
@@ -4168,19 +4188,32 @@ var GNYDNB = (function(){
   function applyTemplate(fill, gentle){
     if (!fill){ seedAllFamilies(); return; }
 
-    if (fill.series && !\$('dnb-series').value){
-      \$('dnb-series').value = fill.series;
-      onSeriesChange();
+    // Series first — syncDescriptionSeries() below prepends whatever is in
+    // this box to the description, so it has to already be the new one.
+    if (fill.series && (!gentle || templateOwned(\$('dnb-series'), seededSeries))){
+      if (\$('dnb-series').value !== fill.series){
+        \$('dnb-series').value = fill.series;
+        onSeriesChange();
+      }
+      seededSeries = fill.series;
     }
+    // The template's own class beats the one the series implies — it is the
+    // more specific answer, and onSeriesChange has just written the other.
     if (fill.classId && !classUserSet){
       \$('dnb-class').value = fill.classId;
+      setHint('dnb-classHint', 'From ' + fill.key, '');
     }
-    if (SEED_DESC && fill.description && (!gentle || !\$('dnb-desc').value.trim())){
+    if (SEED_DESC && fill.description &&
+        (!gentle || templateOwned(\$('dnb-desc'), seededDesc))){
       \$('dnb-desc').value = fill.description;
       syncDescriptionSeries();
+      // Recorded AFTER the sync, because that is what is actually in the box.
+      seededDesc = \$('dnb-desc').value;
     }
-    if (SEED_CUT && fill.cutDetails && (!gentle || !\$('dnb-cut').value.trim())){
+    if (SEED_CUT && fill.cutDetails &&
+        (!gentle || templateOwned(\$('dnb-cut'), seededCut))){
       \$('dnb-cut').value = fill.cutDetails;
+      seededCut = \$('dnb-cut').value;
     }
 
     for (var i=0;i<ALL_FAMILIES.length;i++){
