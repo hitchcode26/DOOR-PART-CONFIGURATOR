@@ -3009,15 +3009,18 @@ ${hideTitle}
 #${WRAP} .tpl-new-head{font-size:11px;color:var(--dnb-muted);margin-bottom:10px}
 #${WRAP} .tpl-new-actions{display:flex;gap:10px;margin-top:10px;flex-wrap:wrap}
 
-/* Number · Series · Description. Fixed tracks for the two short fields and
-   the rest to the description, which is the long one. Two-up on a half
-   screen, with the description taking the full second line. */
-#${WRAP} .row-main{display:grid;grid-template-columns:150px 230px minmax(0,1fr);gap:12px}
+/* Number and Series only — both are short and fixed, so they get exactly the
+   width they need and nothing more. The description gets its own full-width
+   line underneath. */
+#${WRAP} .row-main{display:grid;grid-template-columns:170px 260px;gap:12px}
 #${WRAP} .row-main > *{min-width:0}
-@media(max-width:760px){
-  #${WRAP} .row-main{grid-template-columns:1fr 1fr}
-  #${WRAP} .row-main .span2{grid-column:1 / -1}
-}
+@media(max-width:560px){#${WRAP} .row-main{grid-template-columns:1fr}}
+
+#${WRAP} .desc-wrap{margin-top:2px}
+/* Overrides the 96px floor every other textarea here wants — this one starts
+   at two lines and grows to fit what is in it. */
+#${WRAP} #dnb-desc{min-height:0;height:auto;line-height:1.65;resize:vertical;
+  white-space:pre-wrap;overflow-wrap:anywhere;padding:8px 10px;letter-spacing:.01em}
 
 #${WRAP} .cut-wrap{margin-top:10px}
 #${WRAP} .cut-wrap textarea{min-height:64px}
@@ -3301,12 +3304,19 @@ ${warnBanner}
         <label for="dnb-series">Series</label>
         <select id="dnb-series" class="tabstop">${seriesOptions}</select>
       </div>
-      <div class="span2">
-        <label for="dnb-desc">Description</label>
-        <input id="dnb-desc" class="tabstop" autocomplete="off"
-          placeholder="ENT SQ SD RH WB 32 X 78 ML 805 950 …  (series is added for you)">
-        <div class="hint" id="dnb-descHint">&nbsp;</div>
-      </div>
+    </div>
+
+    <!-- Full width and WRAPPING. These run well past 130 characters — the
+         4000 template's is 134 — and a one-line input turns that into a
+         horizontal scroll where you cannot see the size and the hinge hand at
+         the same time. A textarea shows the whole string at once.
+         It is a textarea for the wrapping only: newlines are stripped on
+         input, because this text goes onto four item records. -->
+    <div class="desc-wrap">
+      <label for="dnb-desc">Description</label>
+      <textarea id="dnb-desc" class="tabstop" rows="2" spellcheck="false"
+        placeholder="ENT SQ SD RH WB 32 X 78 ML 805 950 …  (the series is added to the front for you)"></textarea>
+      <div class="hint" id="dnb-descHint">&nbsp;</div>
     </div>
 
     <!-- Edit-mode only, and deliberately RIGHT HERE rather than down with the
@@ -4619,10 +4629,22 @@ var GNYDNB = (function(){
   }
 
   // ── preview ─────────────────────────────────────────────────────────────
+  // Grows the description box to whatever is in it, so a long one is fully
+  // visible without a scroll and a short one does not leave a hole. Called
+  // from updatePreview, which runs after every path that writes the box —
+  // typing, template fill, door load, copy, reset.
+  function autoGrowDesc(){
+    var el = \$('dnb-desc');
+    if (!el) return;
+    el.style.height = 'auto';
+    el.style.height = Math.max(el.scrollHeight, 34) + 'px';
+  }
+
   // One line next to the Create button. The per-family part numbers, BOM and
   // revision names are already printed at the top of each family card, so a
   // second list of them up here was saying the same thing twice.
   function updatePreview(){
+    autoGrowDesc();
     var line = \$('dnb-preview');
     if (!line) return;
 
@@ -5311,7 +5333,18 @@ var GNYDNB = (function(){
     \$('dnb-rev').addEventListener('change', function(){ refreshNumbers(); updatePreview(); });
     \$('dnb-number').addEventListener('input', onNumberInput);
     \$('dnb-number').addEventListener('blur', checkNumber);
-    \$('dnb-desc').addEventListener('input', updatePreview);
+    \$('dnb-desc').addEventListener('input', function(){
+      // A textarea accepts Enter and pasted line breaks. This text is written
+      // to four item records, so a newline must never survive the box.
+      if (/[\\r\\n]/.test(this.value)){
+        var pos = this.selectionStart;
+        this.value = this.value.replace(/[\\r\\n]+/g, ' ');
+        try { this.selectionStart = this.selectionEnd = Math.min(pos, this.value.length); }
+        catch (e) { /* not focused */ }
+      }
+      autoGrowDesc();
+      updatePreview();
+    });
 
     // Arrow keys work the search dropdown whenever it is open. Enter loads a
     // door that exists; on a free number it advances to Description.
