@@ -246,6 +246,38 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
     // Screens are 101 of 3,183 doors — off by default, checkbox on the form.
     INCLUDE_SCREEN_DEFAULT: false,
 
+    // ── Tube frame ─────────────────────────────────────────────────────
+    // A welded tube sub-assembly that stiffens the CORE. 61 of them exist in
+    // the account and every one was hung off the DOOR's own BOM, which put a
+    // core part one level too high — the door consumed it directly instead of
+    // the core it actually belongs to. New ones go on the core.
+    //
+    // Unlike the frame, core and screen, a tube frame's number does NOT come
+    // off the door number. Engineering assigns it before the door is set up in
+    // NetSuite, so it is TYPED IN rather than derived. That is also why it
+    // carries no family prefix — a plain number, the convention all 61 follow
+    // (1001253, 1001983, 1002120).
+    INCLUDE_TUBE_DEFAULT: false,
+    TUBE_NUMBER_PATTERN: /^[A-Z0-9][A-Z0-9-]*$/,
+    TUBE_NUMBER_MAX: 20,
+
+    // The tube's line on the CORE's BOM. Work order matches how the door
+    // consumes its own sub-assemblies: it is what makes the tube actually get
+    // built rather than expected to be sitting in stock.
+    TUBE_QTY: 1,
+    TUBE_SOURCE: 'WORK_ORDER',
+
+    // Engineering sometimes creates the tube record ahead of the door. If the
+    // typed number already exists, link it onto the core instead of failing —
+    // and do NOT touch it, because it is somebody else's record.
+    TUBE_LINK_IF_EXISTS: true,
+
+    // How a tube frame is recognised on a core's BOM when a door is loaded for
+    // editing: an assembly component whose name is a plain number. Frames,
+    // cores and screens all carry a prefix, and raw stock is 5-digit 99xxx, so
+    // a 6-or-more-digit bare number on a core is a tube and nothing else.
+    TUBE_ON_CORE_PATTERN: /^[0-9]{6,}$/,
+
     // Item source for the F / C / S lines on the DOOR's own BOM.
     // The data is split: 3,560 lines are WORK_ORDER (the long-standing
     // convention) and 2,415 are STOCK (a March 2026 batch). WORK_ORDER is the
@@ -311,20 +343,21 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
     SEARCH_ITEM_TYPES: ['InvtPart', 'Assembly', 'NonInvtPart', 'Kit'],
 
     // ── Door identity ──────────────────────────────────────────────────
-    FAMILY_PREFIX: { DR: 'DR-', F: 'F-', C: 'C-', S: 'S-' },
+    // T has no prefix on purpose — a tube frame is named by its bare number.
+    FAMILY_PREFIX: { DR: 'DR-', F: 'F-', C: 'C-', S: 'S-', T: '' },
 
     // Prepended to the typed description for each sub-assembly. DR takes the
     // description raw.
-    DESC_PREFIX: { DR: '', F: 'FRAME ', C: 'CORE ', S: 'SCREEN DOOR ' },
+    DESC_PREFIX: { DR: '', F: 'FRAME ', C: 'CORE ', S: 'SCREEN DOOR ', T: 'TUBE ' },
 
     // DR revisions are named "... BOM REV-A" (1,151 live), C/F/S are named
     // "... BOM REV A" (2,404 live). Not a typo on either side — they were
     // created by different processes and both are still in use.
-    REV_NAME_SEP: { DR: ' BOM REV-', F: ' BOM REV ', C: ' BOM REV ', S: ' BOM REV ' },
+    REV_NAME_SEP: { DR: ' BOM REV-', F: ' BOM REV ', C: ' BOM REV ', S: ' BOM REV ', T: ' BOM REV ' },
 
     // The door itself has no routing. Zero of 3,183 DR items have one — the
     // work happens on the frame and the core, and the door is the marriage.
-    BUILDS_ROUTING: { DR: false, F: true, C: true, S: true },
+    BUILDS_ROUTING: { DR: false, F: true, C: true, S: true, T: true },
 
     // Door numbers are 7 digits and currently run 10xxxxx. Zero-padded to
     // this width when the next number is suggested.
@@ -397,11 +430,20 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
 
   // Which families a build touches, in creation order. Sub-assemblies first —
   // the door's BOM needs their internal IDs.
-  const BUILD_ORDER = ['F', 'C', 'S', 'DR'];
+  const BUILD_ORDER = ['T', 'F', 'C', 'S', 'DR'];
+
+  // Families whose part number IS derived from the door's series and number.
+  // Every name-building, clash-checking and door-loading path uses this list.
   const ALL_FAMILIES = ['DR', 'F', 'C', 'S'];
 
+  // Every unit that gets a card, a grid and a build. The tube frame is here
+  // but NOT in ALL_FAMILIES, because its number is typed rather than derived —
+  // keeping the two lists apart is what stops the tube being fed into code
+  // that would try to construct its name out of the door number.
+  const ALL_UNITS = ['DR', 'F', 'C', 'S', 'T'];
+
   const FAMILY_LABEL = {
-    DR: 'Door', F: 'Frame', C: 'Core', S: 'Screen door'
+    DR: 'Door', F: 'Frame', C: 'Core', S: 'Screen door', T: 'Tube frame'
   };
 
   // Door series in use, with the item class each one maps to. Taken from the
@@ -477,6 +519,16 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
       { op: 'EXT CUT',  seq: 1, wc: 'Door - Core Framing', ct: 'DR Frame Cutting', run: 5, setup: 0 },
       { op: 'EXT BEND', seq: 2, wc: 'Door - Core Framing', ct: 'DR Frame Bending', run: 5, setup: 0 },
       { op: 'EXT WELD', seq: 2, wc: 'Door - Core Framing', ct: 'DR Frame Welding', run: 5, setup: 0 }
+    ],
+    // Every one of the 61 live tube routings is the same two steps with the
+    // same templates the FRAME uses — EXT CUT on DR Frame Cutting, EXT WELD on
+    // DR Frame Welding, both at Door - Core Framing, run 5 / setup 0. A tube
+    // frame is welded extrusion, so it costs like a frame even though it is
+    // consumed by the core. Bend is offered for the same reason it is on F.
+    T: [
+      { op: 'EXT CUT',  seq: 1, wc: 'Door - Core Framing', ct: 'DR Frame Cutting', run: 5, setup: 0 },
+      { op: 'EXT WELD', seq: 2, wc: 'Door - Core Framing', ct: 'DR Frame Welding', run: 5, setup: 0 },
+      { op: 'EXT BEND', seq: 2, wc: 'Door - Core Framing', ct: 'DR Frame Bending', run: 5, setup: 0 }
     ]
   };
 
@@ -485,13 +537,15 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
   const DEFAULT_STEPS = {
     F: ['EXT CUT', 'EXT WELD'],
     C: ['EXT CUT', 'LAMINATION', 'ROUTING'],
-    S: ['EXT CUT']
+    S: ['EXT CUT'],
+    T: ['EXT CUT', 'EXT WELD']
   };
 
   // How many blank component rows each family opens with. Frames run about 3
   // lines, cores 6-11, screens 8-10, and the door itself usually adds no
   // loose hardware at all beyond the sub-assemblies.
-  const DEFAULT_COMPONENT_ROWS = { DR: 1, F: 3, C: 6, S: 4 };
+  // Tubes run lean: the tube extrusion, and often a sheet of .125 aluminium.
+  const DEFAULT_COMPONENT_ROWS = { DR: 1, F: 3, C: 6, S: 4, T: 2 };
 
   const WRAP = 'gny-dnb';
   const NS_ITEM = '/app/common/item/item.nl?id=';
@@ -680,6 +734,7 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
       // and read the template's live BOM and routing.
       if (api === 'template')      return loadTemplateFill(params.term || '', params.fresh === '1');
       if (api === 'nextnumber')    return { number: nextDoorNumber() };
+      if (api === 'checkitem')     return checkItemName(params.term || '');
       if (api === 'checkdoor')     return checkDoorNumber(params.term || '');
       if (api === 'loaddoor')      return loadDoorForEdit(params.term || '');
       if (api === 'doors')         return searchDoors(params.term || '');
@@ -690,6 +745,24 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
   }
 
   function sq(str) { return String(str || '').replace(/'/g, "''"); }
+
+  // Is this exact item name already taken, and by what? Powers the tube-frame
+  // number box, where an existing number means "link it" rather than "clash".
+  function checkItemName(term) {
+    const name = String(term || '').trim().toUpperCase();
+    if (!name) return { ok: false, message: 'Enter a number.' };
+    const found = checkPartNumbers([name]);
+    const id = found[name];
+    if (!id) return { ok: true, exists: false, name: name };
+    let desc = '';
+    try {
+      const rs = query.runSuiteQL({
+        query: `SELECT displayname, itemtype FROM item WHERE id = ${parseInt(id, 10)}`
+      }).asMappedResults();
+      if (rs[0]) desc = rs[0].displayname || '';
+    } catch (e) { /* name is enough */ }
+    return { ok: true, exists: true, id: String(id), name: name, desc: desc };
+  }
 
   // Collapses runs of whitespace before comparing. "DR  Core Lamination" is
   // the real name of a real cost template, double space and all, and a naive
@@ -777,10 +850,19 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
   function nextDoorNumber() {
     let max = 0;
     try {
+      // Tube frames are named with a BARE number off this same pool — 61 of
+      // them, running to 1002199 against a door maximum of 1002257. The
+      // original query only counted prefixed names, so every one of them was
+      // invisible to this counter and nothing but luck kept the two runs from
+      // colliding. Bare numbers at the door location are counted now.
+      const loc = parseInt(CFG.LOCATION_ID, 10);
+      const bareClause = loc
+        ? ` OR (REGEXP_LIKE(itemid, '^[0-9]{6,}$') AND location = ${loc})`
+        : '';
       const rows = query.runSuiteQL({
         query: `SELECT MAX(TO_NUMBER(REGEXP_SUBSTR(itemid, '[0-9]+$'))) AS maxnum
                 FROM item
-                WHERE REGEXP_LIKE(itemid, '^(DR|C|F|S)-[0-9]+-[0-9]{6,}$')`
+                WHERE REGEXP_LIKE(itemid, '^(DR|C|F|S)-[0-9]+-[0-9]{6,}$')${bareClause}`
       }).asMappedResults();
       max = parseInt(rows[0] && rows[0].maxnum, 10) || 0;
     } catch (e) {
@@ -1459,6 +1541,53 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
       dr.components = loose;
     }
 
+    // The tube frame is NOT derivable from the door number, so it cannot be
+    // looked up by name the way the frame and core are — it is found by shape
+    // on the core's BOM: an assembly component whose name is a bare number.
+    // Frames, cores and screens all carry a prefix and raw stock is 5-digit
+    // 99xxx, so a 6-or-more-digit bare number on a core is a tube frame.
+    //
+    // It lands in subLines for the same reason the door's own sub-assemblies
+    // do: this tool owns that line and re-derives it, and nobody should be
+    // able to drop the tube out of a core by clearing a hardware row.
+    const core = out.families.C;
+    if (core && core.components) {
+      const keptC = [], tubes = [];
+      for (const c of core.components) {
+        const isTube = String(c.itemType || '') === 'Assembly' &&
+                       CFG.TUBE_ON_CORE_PATTERN.test(String(c.itemNumber || ''));
+        if (isTube) tubes.push(c); else keptC.push(c);
+      }
+      if (tubes.length) {
+        core.components = keptC;
+        core.subLines = tubes;
+        out.hasTube = true;
+        out.tubeNumber = tubes[0].itemNumber;
+        const tUnit = loadFamilyUnit('T', tubes[0].itemNumber, tubes[0].itemId, out.warnings);
+        if (tUnit) out.families.T = tUnit;
+        if (tubes.length > 1) {
+          out.warnings.push('The core carries ' + tubes.length + ' tube-frame lines; only ' +
+                            tubes[0].itemNumber + ' is editable here.');
+        }
+      }
+    }
+
+    // Doors built before the tube went on the core still carry it on the DOOR
+    // BOM. Say so rather than quietly showing it as loose hardware — it is the
+    // exact thing this feature exists to stop.
+    if (!out.hasTube && dr.components) {
+      const strays = dr.components.filter(c =>
+        String(c.itemType || '') === 'Assembly' &&
+        CFG.TUBE_ON_CORE_PATTERN.test(String(c.itemNumber || '')));
+      if (strays.length) {
+        out.tubeOnDoor = strays.map(c => c.itemNumber);
+        out.warnings.push('Tube frame ' + out.tubeOnDoor.join(', ') +
+                          ' is on the DOOR BOM, not the core. It is shown as loose hardware ' +
+                          'below and is left exactly where it is — moving it is a BOM change ' +
+                          'to make deliberately, not a side effect of opening the door.');
+      }
+    }
+
     return out;
   }
 
@@ -1760,9 +1889,31 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
       const wantScreen = !!p.includeScreen;
       const families = ['F', 'C'].concat(wantScreen ? ['S'] : []);
 
+      // The tube frame's number is typed, not derived — engineering assigns it
+      // before the door reaches NetSuite. Validated here rather than trusted,
+      // because it becomes an item name.
+      const wantTube = !!p.includeTube;
+      let tubeNumber = '';
+      if (wantTube) {
+        tubeNumber = String(p.tubeNumber || '').trim().toUpperCase();
+        if (!tubeNumber) {
+          throw new Error('Tube frame number is required — it is the number engineering assigned.');
+        }
+        if (tubeNumber.length > CFG.TUBE_NUMBER_MAX) {
+          throw new Error('Tube frame number is too long — keep it under ' +
+                          CFG.TUBE_NUMBER_MAX + ' characters.');
+        }
+        if (!CFG.TUBE_NUMBER_PATTERN.test(tubeNumber)) {
+          throw new Error('The tube frame number can only use letters, digits and dashes. "' +
+                          tubeNumber + '" does not.');
+        }
+      }
+
       const nums = familyNumbers(series, tail);
       const wanted = families.concat(['DR']).map(f => nums[f]);
-      const existing = checkPartNumbers(wanted);
+      // The tube goes in the same lookup so it costs no extra round trip, but
+      // it is NOT a clash if it comes back — see below.
+      const existing = checkPartNumbers(wanted.concat(wantTube ? [tubeNumber] : []));
       const clashes = wanted.filter(n => existing[n.toUpperCase()]);
       if (clashes.length) {
         throw new Error(
@@ -1773,8 +1924,33 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
         );
       }
 
+      // An existing tube number is not a clash. Engineering creates the tube
+      // record ahead of the door often enough that failing on it would be
+      // wrong — it gets linked onto the core untouched instead. Nothing about
+      // that record is edited, because it is not this build's to edit.
+      const tubeExistingId = wantTube ? (existing[tubeNumber.toUpperCase()] || '') : '';
+      if (wantTube && tubeExistingId && !CFG.TUBE_LINK_IF_EXISTS) {
+        throw new Error(tubeNumber + ' already exists. Pick a different tube frame number.');
+      }
+
       // ── Per-family payloads off the form ───────────────────────────────
       const inbound = p.families || {};
+
+      // A tube being LINKED has no grids to validate — the record already
+      // exists and this build does not touch it.
+      if (wantTube && !tubeExistingId) {
+        const tf = inbound.T || {};
+        const tcomps = (tf.components || []).filter(c => c.itemId);
+        if (!tcomps.length) {
+          throw new Error(FAMILY_LABEL.T + ' needs at least one component.');
+        }
+        const tsteps = (tf.steps || []).filter(st => st.operationName);
+        if (!tsteps.length) {
+          throw new Error(FAMILY_LABEL.T + ' needs at least one routing step.');
+        }
+        validateSequences(tsteps, FAMILY_LABEL.T);
+      }
+
       for (const f of families) {
         const fam = inbound[f] || {};
         const comps = (fam.components || []).filter(c => c.itemId);
@@ -1824,6 +2000,12 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
       if (families.indexOf('S') !== -1 && !((src && src.items.S) || (tpl && tpl.items.S))) {
         templateItems.S = templateItems.F || templateItems.S;
       }
+      // Same reasoning for the tube: it is welded extrusion that costs like a
+      // frame and routes like a frame, so the frame is what it should inherit
+      // its accounts, units and costing method from.
+      if (wantTube) {
+        templateItems.T = templateItems.F || '';
+      }
 
       // Same stamp as the fill payload, so a source or template edited in
       // NetSuite between builds does not hand the next door a stale field
@@ -1833,7 +2015,7 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
       const stampSubject = src || tpl;
       const tplStamp = stampSubject ? templateStamp(stampSubject) : '';
       const defaults = {};
-      for (const f of families.concat(['DR'])) {
+      for (const f of families.concat(['DR'], wantTube ? ['T'] : [])) {
         defaults[f] = getTemplateDefaultsById(templateItems[f], tplStamp);
       }
       out.templateUsed = src ? src.key : (tpl ? tpl.key : null);
@@ -1872,10 +2054,55 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
       const cutDetails = String(p.cutDetails == null ? '' : p.cutDetails);
       const doorLine = p.doorLine ? String(p.doorLine).trim() : '';
 
-      // ── 1. Sub-assemblies first — the door's BOM needs their IDs ───────
+      // ── 1. The tube frame, before anything else ────────────────────────
+      // It goes first because the CORE's BOM consumes it, and the core cannot
+      // be built until the tube has an internal ID. This is the level the tube
+      // belongs at: it stiffens the core, so the core is what should call for
+      // it. Hanging it off the door — which is how all 61 existing ones were
+      // done — made the door consume a core part directly.
+      let tubeItemId = '';
+      if (wantTube) {
+        if (tubeExistingId) {
+          tubeItemId = String(tubeExistingId);
+          out.tubeLinked = true;
+        } else {
+          const tf = inbound.T || {};
+          const tubeBuilt = buildUnit({
+            timer, family: 'T', created,
+            partNum: tubeNumber,
+            description: CFG.DESC_PREFIX.T + description,
+            defaults: defaults.T,
+            subsidiaryId, locationId, classId,
+            cutDetails: '',    // the cut list lives on the door only
+            doorLine: doorLine,
+            components: (tf.components || []).filter(c => c.itemId),
+            steps: (tf.steps || []).filter(st => st.operationName),
+            effectiveDate,
+            revLetter: p.revLetter,
+            revMemo: p.revMemo,
+            autoIssue: p.autoIssue
+          });
+          tubeItemId = tubeBuilt.item.id;
+          out.families.T = tubeBuilt;
+          out.tubeLinked = false;
+        }
+        out.tubeNumber = tubeNumber;
+      }
+
+      // ── 2. Sub-assemblies — the door's BOM needs their IDs ─────────────
       const built = {};
       for (const f of families) {
         const fam = inbound[f] || {};
+        let comps = (fam.components || []).filter(c => c.itemId);
+        // The tube rides at the TOP of the core's BOM, ahead of the loose
+        // stock, the same way the sub-assemblies lead the door's own BOM.
+        if (f === 'C' && tubeItemId) {
+          comps = [{
+            itemId: tubeItemId,
+            quantity: CFG.TUBE_QTY,
+            itemSource: CFG.TUBE_SOURCE
+          }].concat(comps);
+        }
         built[f] = buildUnit({
           timer, family: f, created,
           partNum: nums[f],
@@ -1884,7 +2111,7 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
           subsidiaryId, locationId, classId,
           cutDetails: '',     // the cut list lives on the door only
           doorLine: doorLine,
-          components: (fam.components || []).filter(c => c.itemId),
+          components: comps,
           steps: (fam.steps || []).filter(s => s.operationName),
           effectiveDate,
           revLetter: p.revLetter,
@@ -1894,7 +2121,7 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
         out.families[f] = built[f];
       }
 
-      // ── 2. The door, consuming them ────────────────────────────────────
+      // ── 3. The door, consuming them ────────────────────────────────────
       const drFam = inbound.DR || {};
       const subLines = [];
       for (const f of CFG.DR_COMPONENT_ORDER) {
@@ -1966,10 +2193,14 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
       }
 
       const subCount = families.length;
+      const tubeNote = !wantTube ? ''
+        : (out.tubeLinked
+            ? ' Existing tube ' + tubeNumber + ' linked onto the core.'
+            : ' Tube ' + tubeNumber + ' created on the core.');
       out.message = asTemplate
         ? 'Template ' + nums.DR + ' created — pick it from the list to build doors from it.'
         : nums.DR + ' created with ' + subCount + ' sub-assembl' +
-          (subCount === 1 ? 'y' : 'ies') + '.';
+          (subCount === 1 ? 'y' : 'ies') + '.' + tubeNote;
       return out;
 
     } catch (e) {
@@ -2361,7 +2592,9 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
       if (!description) throw new Error('Description is required.');
 
       const inbound = p.families || {};
-      const present = ALL_FAMILIES.filter(f => inbound[f] && inbound[f].itemId);
+      // ALL_UNITS, not ALL_FAMILIES — the tube frame is a unit with an item, a
+      // BOM, a revision and a routing, and it has to be saved like one.
+      const present = ALL_UNITS.filter(f => inbound[f] && inbound[f].itemId);
       if (!present.length) throw new Error('Nothing loaded. Reload the door and try again.');
 
       // Validate everything BEFORE writing anything. A sequence clash found
@@ -2892,8 +3125,8 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
 
     // One card per sub-assembly family, generated so frame/core/screen stay
     // structurally identical and can't drift apart by hand-editing.
-    function famCard(f, n, note) {
-      const hidden = (f === 'S') ? ' style="display:none"' : '';
+    function famCard(f, n, note, extraTop) {
+      const hidden = (f === 'S' || f === 'T') ? ' style="display:none"' : '';
       return `
 <div class="card fam-card" id="dnb-card-${f}"${hidden}>
   <div class="card-head">
@@ -2902,6 +3135,7 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
   </div>
   <div class="card-body">
     <div class="fam-num" id="dnb-num-${f}">&nbsp;</div>
+    ${extraTop || ''}
 
     <div class="sub-label">Components</div>
     <div class="twrap comp-wrap">
@@ -3022,6 +3256,9 @@ ${hideTitle}
 #${WRAP} #dnb-desc{min-height:0;height:auto;line-height:1.65;resize:vertical;
   white-space:pre-wrap;overflow-wrap:anywhere;padding:8px 10px;letter-spacing:.01em}
 
+/* The tube number is typed, not derived, so it gets a real field at the top
+   of its card rather than the read-only derived line the others show. */
+#${WRAP} .tube-num{max-width:340px;margin-bottom:12px}
 #${WRAP} .cut-wrap{margin-top:10px}
 #${WRAP} .cut-wrap textarea{min-height:64px}
 #${WRAP} .cut-wrap label .dim{text-transform:none;letter-spacing:0;font-family:var(--dnb-font);font-size:10px}
@@ -3375,6 +3612,10 @@ ${warnBanner}
               <input type="checkbox" class="chk" id="dnb-screen" onchange="GNYDNB.toggleScreen()">
               Include screen door
             </label>
+            <label class="inline-lbl">
+              <input type="checkbox" class="chk" id="dnb-tube" onchange="GNYDNB.toggleTube()">
+              Include tube frame <span class="dim">(on the core)</span>
+            </label>
           </div>
         </div>
       </div>
@@ -3419,8 +3660,16 @@ ${warnBanner}
 </div>
 
 ${famCard('F', 3, 'Outer extrusion, seal, hinges. Cut then weld, or cut then bend.')}
-${famCard('C', 4, 'Inner extrusion, skins, foam, adhesive, hardware. Cut, laminate, route.')}
-${famCard('S', 5, 'Screen frame extrusion, mesh, hardware. Usually cut only.')}
+${famCard('C', 4, 'Inner extrusion, skins, foam, adhesive, hardware. Cut, laminate, route.',
+  '<div class="sub-lines" id="dnb-subLines-C" style="display:none"></div>')}
+${famCard('T', 5, 'Tube extrusion, sometimes a sheet of .125 aluminium. Cut then weld.',
+  `<div class="tube-num">
+     <label for="dnb-tubeNumber">Tube frame number</label>
+     <input id="dnb-tubeNumber" class="tabstop" autocomplete="off"
+       placeholder="the number engineering assigned">
+     <div class="hint" id="dnb-tubeHint">&nbsp;</div>
+   </div>`)}
+${famCard('S', 6, 'Screen frame extrusion, mesh, hardware. Usually cut only.')}
 
 <div class="actions">
   <button type="button" class="btn-primary tabstop" id="dnb-submit" onclick="GNYDNB.submit()">Create door</button>
@@ -3491,12 +3740,19 @@ var GNYDNB = (function(){
 
   var SUB_FAMILIES = ['F', 'C', 'S'];
   var ALL_FAMILIES = ['DR', 'F', 'C', 'S'];
+  // Everything with a card and a grid. The tube frame is here but not in
+  // ALL_FAMILIES, because its number is typed rather than derived from the
+  // door — see the server-side note on the same split.
+  var ALL_UNITS = ['DR', 'F', 'C', 'S', 'T'];
+  var INCLUDE_TUBE_DEFAULT = ${CFG.INCLUDE_TUBE_DEFAULT ? 'true' : 'false'};
+  var TUBE_QTY = ${CFG.TUBE_QTY};
+  var TUBE_SOURCE = ${JSON.stringify(CFG.TUBE_SOURCE)};
   var DOOR_NOTE_NEW =
     'A new number builds a door; an existing one loads it to edit or copy.';
 
   var root;
-  var rowCount = { DR:0, F:0, C:0, S:0 };
-  var stepCount = { F:0, C:0, S:0 };
+  var rowCount = { DR:0, F:0, C:0, S:0, T:0 };
+  var stepCount = { F:0, C:0, S:0, T:0 };
   var acTimers = {}, acData = {}, acActive = {}, acQueryCache = {};
 
   // ── mode ────────────────────────────────────────────────────────────────
@@ -3548,6 +3804,15 @@ var GNYDNB = (function(){
   function activeFamilies(){
     var out = ['F', 'C'];
     if (\$('dnb-screen').checked) out.push('S');
+    return out;
+  }
+
+  // Units whose grids get collected and sent. The tube is separate from
+  // activeFamilies because the server takes it on its own key, not as one of
+  // the door-numbered families.
+  function activeUnits(){
+    var out = activeFamilies().concat(['DR']);
+    if (\$('dnb-tube').checked) out.push('T');
     return out;
   }
 
@@ -3627,7 +3892,64 @@ var GNYDNB = (function(){
           : '&nbsp;';
       }
     }
+
+    // The tube is named by what was typed, not by the door number, so its line
+    // is built from the box rather than derived like the others.
+    var tEl = \$('dnb-num-T');
+    if (tEl){
+      if (!\$('dnb-tube').checked){
+        tEl.innerHTML = '&nbsp;';
+      } else if (mode === 'edit' && editData && editData.families.T){
+        var tu = editData.families.T;
+        tEl.innerHTML = '<a href="/app/common/item/item.nl?id=' + tu.itemId + '" target="_blank">' +
+          esc(tu.partNumber) + '</a> &middot; ' + esc(tu.bomName || 'no BOM') +
+          (tu.revName ? ' &middot; ' + esc(tu.revName) : '');
+      } else {
+        var tn = \$('dnb-tubeNumber') ? \$('dnb-tubeNumber').value.trim() : '';
+        tEl.innerHTML = tn
+          ? esc(tn) + ' &middot; ' + esc(tn + ' BOM') + ' &middot; ' +
+            esc(tn + REV_NAME_SEP.T + \$('dnb-rev').value) + ' &middot; ' + esc(tn + ' ROUTING')
+          : '<span class="dim">Enter the tube frame number.</span>';
+      }
+    }
+
     renderSubLines();
+    renderCoreSubLines();
+  }
+
+  // The tube's line on the CORE's BOM, shown read-only for the same reason the
+  // door's sub-assembly lines are: this tool owns that line, and nobody should
+  // be able to drop the tube out of a core by clearing a hardware row.
+  function renderCoreSubLines(){
+    var box = \$('dnb-subLines-C');
+    if (!box) return;
+
+    if (mode === 'edit' && editData){
+      var lines = (editData.families.C && editData.families.C.subLines) || [];
+      if (!lines.length){ box.style.display = 'none'; return; }
+      var h = '';
+      for (var i=0;i<lines.length;i++){
+        h += '<div class="sub-line">' +
+             '<span>' + esc(lines[i].itemNumber) + '</span>' +
+             '<span class="sl-qty">x' + esc(lines[i].quantity) + '</span>' +
+             '<span class="sl-src">' + esc(lines[i].itemSource) + '</span>' +
+             '<span class="sl-src">tube frame</span>' +
+             '</div>';
+      }
+      box.innerHTML = h;
+      box.style.display = '';
+      return;
+    }
+
+    if (!\$('dnb-tube').checked){ box.style.display = 'none'; return; }
+    var tn = \$('dnb-tubeNumber') ? \$('dnb-tubeNumber').value.trim() : '';
+    box.innerHTML = '<div class="sub-line">' +
+      '<span>' + (tn ? esc(tn) : '&lt;tube frame&gt;') + '</span>' +
+      '<span class="sl-qty">x' + esc(TUBE_QTY) + '</span>' +
+      '<span class="sl-src">' + esc(TUBE_SOURCE) + '</span>' +
+      '<span class="sl-src">tube frame</span>' +
+      '</div>';
+    box.style.display = '';
   }
 
   // The door's own BOM lines for its sub-assemblies. Rendered read-only so
@@ -3841,6 +4163,12 @@ var GNYDNB = (function(){
     \$('dnb-class').value = r.classId || '';
     \$('dnb-cut').value = r.cutDetails || '';
     \$('dnb-screen').checked = !!r.hasScreen;
+    \$('dnb-tube').checked = !!r.hasTube;
+    \$('dnb-tubeNumber').value = r.tubeNumber || '';
+    setHint('dnb-tubeHint', r.hasTube
+      ? 'Loaded from the core of ' + r.doorNumber + '.'
+      : '', r.hasTube ? 'good' : '');
+    tubeSetGridsEnabled(true);
     \$('dnb-newOnlyRow').style.display = 'none';
     // Templates describe what a NEW door starts as. Applying one to a door
     // that already exists would silently replace its real BOM with a
@@ -3848,7 +4176,7 @@ var GNYDNB = (function(){
     setTemplatePickerEnabled(false, 'Locked while editing ' + r.doorNumber +
       ' — "+ New template" still works if you want to save this setup.');
     \$('dnb-doorNote').textContent = 'Editing ' + r.doorNumber + ' — ' +
-      ALL_FAMILIES.filter(function(f){ return r.families[f]; })
+      ALL_UNITS.filter(function(f){ return r.families[f]; })
         .map(function(f){ return FAMILY_LABEL[f].toLowerCase(); }).join(', ') + ' loaded.';
 
     // Only show the cards for families this door actually has. A door with no
@@ -3858,9 +4186,11 @@ var GNYDNB = (function(){
       var card = \$('dnb-card-' + f);
       if (card) card.style.display = r.families[f] ? '' : 'none';
     }
+    var tCard = \$('dnb-card-T');
+    if (tCard) tCard.style.display = r.families.T ? '' : 'none';
 
-    for (var k=0;k<ALL_FAMILIES.length;k++){
-      var fam = ALL_FAMILIES[k];
+    for (var k=0;k<ALL_UNITS.length;k++){
+      var fam = ALL_UNITS[k];
       var u = r.families[fam];
       \$('dnb-compBody-' + fam).innerHTML = ''; rowCount[fam] = 0;
       if (BUILDS_ROUTING[fam]){
@@ -3954,8 +4284,8 @@ var GNYDNB = (function(){
     \$('dnb-newRevBtn').style.display = 'none';
     \$('dnb-editActions').classList.remove('open');
     setTemplatePickerEnabled(true, '');
-    for (var i=0;i<ALL_FAMILIES.length;i++){
-      var revRow = \$('dnb-editRev-' + ALL_FAMILIES[i]);
+    for (var i=0;i<ALL_UNITS.length;i++){
+      var revRow = \$('dnb-editRev-' + ALL_UNITS[i]);
       if (revRow) revRow.style.display = 'none';
     }
     toggleScreen();
@@ -3976,6 +4306,71 @@ var GNYDNB = (function(){
     }
     refreshNumbers();
     updatePreview();
+  }
+
+  // The tube frame hangs off the CORE, not the door — that is the whole point
+  // of it. Ticking the box opens its card and puts a placeholder line at the
+  // top of the core's BOM box so the level is visible before anything is built.
+  function toggleTube(){
+    var on = \$('dnb-tube').checked;
+    var card = \$('dnb-card-T');
+    if (card) card.style.display = on ? '' : 'none';
+    if (on && !rowCount.T){
+      fillFamily('T', (templateFill && templateFill.families) ? templateFill.families.T : null);
+    }
+    if (!on) setHint('dnb-tubeHint', '', '');
+    refreshNumbers();
+    updatePreview();
+  }
+
+  // Engineering assigns the tube number ahead of the door, so the number may
+  // already be a live item. Existing means LINK it onto the core untouched;
+  // free means this build creates it. Either is fine — the box just has to say
+  // which, because they are very different outcomes.
+  var tubeReqSeq = 0;
+  function checkTubeNumber(){
+    var el = \$('dnb-tubeNumber');
+    if (!el) return;
+    el.value = el.value.toUpperCase();
+    var val = el.value.trim();
+    refreshNumbers();
+    updatePreview();
+    if (!val){ setHint('dnb-tubeHint', '', ''); tubeSetGridsEnabled(true); return; }
+
+    var seq = ++tubeReqSeq;
+    clearTimeout(acTimers.__tube);
+    acTimers.__tube = setTimeout(function(){
+      var xhr = new XMLHttpRequest();
+      xhr.open('GET', baseUrl() + '&api=checkitem&term=' + encodeURIComponent(val), true);
+      xhr.onload = function(){
+        if (seq !== tubeReqSeq) return;
+        try {
+          var t = xhr.responseText, a = t.indexOf('{'), b = t.lastIndexOf('}');
+          var res = JSON.parse(t.slice(a, b+1));
+          if (!res.ok) return;
+          if (res.exists){
+            setHint('dnb-tubeHint', 'Exists already — it will be linked onto the core, ' +
+              'untouched. ' + (res.desc || ''), 'good');
+            tubeSetGridsEnabled(false);
+          } else {
+            setHint('dnb-tubeHint', 'Free — will be created from the grid below.', '');
+            tubeSetGridsEnabled(true);
+          }
+        } catch(err){}
+      };
+      xhr.send();
+    }, 250);
+  }
+
+  // A tube that already exists is not this build's to edit, so its grids go
+  // quiet rather than inviting changes that would never be saved.
+  function tubeSetGridsEnabled(on){
+    var card = \$('dnb-card-T');
+    if (!card) return;
+    var inputs = card.querySelectorAll('#dnb-compBody-T input, #dnb-compBody-T select, ' +
+      '#dnb-stepBody-T input, #dnb-stepBody-T select, #dnb-card-T .btn-add');
+    for (var i=0;i<inputs.length;i++) inputs[i].disabled = !on;
+    card.style.opacity = on ? '' : '.55';
   }
 
   // ── components ──────────────────────────────────────────────────────────
@@ -4272,11 +4667,16 @@ var GNYDNB = (function(){
                      .replace(/^\\s*TEMPLATE\\s*[-:]?\\s*/i, '').trim(),
       cutDetails: editData.cutDetails || '',
       hasScreen: !!editData.families.S,
+      // The tube's GRIDS carry over, its NUMBER never does. Engineering issues
+      // one number per tube and every door gets its own, so reusing the source
+      // door's number would quietly point two doors at one tube — exactly the
+      // sharing that made 1001253 turn up on two doors.
+      hasTube: !!editData.families.T,
       families: {},
       warnings: []
     };
-    for (var i=0;i<ALL_FAMILIES.length;i++){
-      var f = ALL_FAMILIES[i], u = editData.families[f];
+    for (var i=0;i<ALL_UNITS.length;i++){
+      var f = ALL_UNITS[i], u = editData.families[f];
       if (!u) continue;
       out.families[f] = {
         itemId: u.itemId,
@@ -4306,11 +4706,20 @@ var GNYDNB = (function(){
 
     \$('dnb-screen').checked = !!snap.hasScreen;
     toggleScreen();
+    \$('dnb-tube').checked = !!snap.hasTube;
+    toggleTube();
     classUserSet = false;
     applyTemplate(snap, false);   // description, class, cut details, every grid
 
     \$('dnb-number').value = '';
     setHint('dnb-numberHint', '', '');
+    // Blanked on purpose — a copy needs its OWN tube number from engineering.
+    \$('dnb-tubeNumber').value = '';
+    tubeSetGridsEnabled(true);
+    if (snap.hasTube){
+      setHint('dnb-tubeHint', 'Enter this door\\u2019s own tube number — ' +
+        'the copied one belongs to ' + snap.key + '.', 'bad');
+    }
     fetchNextNumber();
 
     setHint('dnb-templateHint',
@@ -4394,8 +4803,8 @@ var GNYDNB = (function(){
   // True once anything has been typed into a grid, so re-filling can ask
   // first instead of silently throwing away work.
   function gridsAreDirty(){
-    for (var i=0;i<ALL_FAMILIES.length;i++){
-      var fam = ALL_FAMILIES[i];
+    for (var i=0;i<ALL_UNITS.length;i++){
+      var fam = ALL_UNITS[i];
       for (var r=0;r<rowCount[fam];r++){
         var el = \$('dnb-comp-item-' + fam + r);
         if (el && el.value.trim()) return true;
@@ -4504,16 +4913,18 @@ var GNYDNB = (function(){
       seededCut = \$('dnb-cut').value;
     }
 
-    for (var i=0;i<ALL_FAMILIES.length;i++){
-      var fam = ALL_FAMILIES[i];
+    for (var i=0;i<ALL_UNITS.length;i++){
+      var fam = ALL_UNITS[i];
       if (fam === 'S' && !\$('dnb-screen').checked){ clearFamilyGrids(fam); continue; }
+      if (fam === 'T' && !\$('dnb-tube').checked){ clearFamilyGrids(fam); continue; }
       fillFamily(fam, fill.families ? fill.families[fam] : null);
     }
 
     var counts = [];
-    for (var k=0;k<ALL_FAMILIES.length;k++){
-      var f = ALL_FAMILIES[k];
+    for (var k=0;k<ALL_UNITS.length;k++){
+      var f = ALL_UNITS[k];
       if (f === 'S' && !\$('dnb-screen').checked) continue;
+      if (f === 'T' && !\$('dnb-tube').checked) continue;
       counts.push(FAMILY_LABEL[f].toLowerCase() + ' ' + rowCount[f] +
                   (BUILDS_ROUTING[f] ? '/' + stepCount[f] : ''));
     }
@@ -4656,7 +5067,7 @@ var GNYDNB = (function(){
     var s = \$('dnb-series').value, n = \$('dnb-number').value.trim();
     if (!s || !n){ line.innerHTML = ''; return; }
 
-    var all = activeFamilies().concat(['DR']);
+    var all = activeUnits();
     var records = 0;
     for (var i=0;i<all.length;i++) records += 3 + (BUILDS_ROUTING[all[i]] ? 1 : 0);
     line.innerHTML = 'Creates <b>' + esc(partNumberFor('DR')) + '</b> &middot; ' +
@@ -4794,12 +5205,14 @@ var GNYDNB = (function(){
       classId: \$('dnb-class').value,
       cutDetails: \$('dnb-cut').value,
       includeScreen: \$('dnb-screen').checked,
+      includeTube: \$('dnb-tube').checked,
+      tubeNumber: \$('dnb-tubeNumber').value.trim(),
       autoIssue: \$('dnb-autoIssue').checked,
       revLetter: 'A',
       families: {}
     };
 
-    var fams = activeFamilies().concat(['DR']);
+    var fams = activeUnits();
     for (var i=0;i<fams.length;i++){
       var got = collectFamily(fams[i]);
       if (!got) return;
@@ -4856,13 +5269,21 @@ var GNYDNB = (function(){
       classId: \$('dnb-class').value,
       cutDetails: \$('dnb-cut').value,
       includeScreen: \$('dnb-screen').checked,
+      includeTube: \$('dnb-tube').checked,
+      tubeNumber: \$('dnb-tubeNumber').value.trim(),
       autoIssue: \$('dnb-autoIssue').checked,
       revLetter: \$('dnb-rev').value,
       effectiveDate: \$('dnb-date').value.trim(),
       families: {}
     };
 
-    var fams = activeFamilies().concat(['DR']);
+    if (payload.includeTube && !payload.tubeNumber){
+      showError('Enter the tube frame number — it is the number engineering assigned.');
+      \$('dnb-tubeNumber').focus();
+      return;
+    }
+
+    var fams = activeUnits();
     for (var i=0;i<fams.length;i++){
       var got = collectFamily(fams[i]);
       if (!got) return;
@@ -4896,8 +5317,8 @@ var GNYDNB = (function(){
       families: {}
     };
 
-    for (var i=0;i<ALL_FAMILIES.length;i++){
-      var f = ALL_FAMILIES[i];
+    for (var i=0;i<ALL_UNITS.length;i++){
+      var f = ALL_UNITS[i];
       var u = editData.families[f];
       if (!u) continue;
       var got = collectFamily(f);
@@ -4963,8 +5384,8 @@ var GNYDNB = (function(){
     var h = '<h3>' + esc(r.message) +
       (r.ms ? ' <span class="dim" style="font-weight:400">' + (r.ms/1000).toFixed(1) + 's</span>' : '') +
       '</h3><ul>';
-    for (var i=0;i<ALL_FAMILIES.length;i++){
-      var f = ALL_FAMILIES[i], u = r.families[f];
+    for (var i=0;i<ALL_UNITS.length;i++){
+      var f = ALL_UNITS[i], u = r.families[f];
       if (!u) continue;
       h += '<li><a href="/app/common/item/item.nl?id=' + u.item.id + '" target="_blank">' +
            esc(u.name) + '</a> &middot; ' +
@@ -5006,8 +5427,8 @@ var GNYDNB = (function(){
     var h = '<h3>' + esc(r.message) +
       (r.ms ? ' <span class="dim" style="font-weight:400">' + (r.ms/1000).toFixed(1) + 's</span>' : '') +
       '</h3><ul>';
-    for (var i=0;i<ALL_FAMILIES.length;i++){
-      var f = ALL_FAMILIES[i], u = r.families[f];
+    for (var i=0;i<ALL_UNITS.length;i++){
+      var f = ALL_UNITS[i], u = r.families[f];
       if (!u) continue;
       h += '<li>' + esc(u.partNumber);
       if (u.closedRevision){
@@ -5083,8 +5504,8 @@ var GNYDNB = (function(){
     var list = loadRecent();
     var dr = r.families.DR;
     var parts = [];
-    for (var i=0;i<ALL_FAMILIES.length;i++){
-      var f = ALL_FAMILIES[i], u = r.families[f];
+    for (var i=0;i<ALL_UNITS.length;i++){
+      var f = ALL_UNITS[i], u = r.families[f];
       if (!u || f === 'DR') continue;
       parts.push({ label: f, itemId: u.item.id, part: u.name });
     }
@@ -5114,8 +5535,8 @@ var GNYDNB = (function(){
     var dr = r.families.DR || {};
     var rev = dr.revision || {};
     var parts = [];
-    for (var i=0;i<ALL_FAMILIES.length;i++){
-      var f = ALL_FAMILIES[i], u = editData.families[f];
+    for (var i=0;i<ALL_UNITS.length;i++){
+      var f = ALL_UNITS[i], u = editData.families[f];
       if (!u || f === 'DR') continue;
       parts.push({ label: f, itemId: u.itemId, part: u.partNumber });
     }
@@ -5241,6 +5662,12 @@ var GNYDNB = (function(){
     // Mid-copy the source door decides whether there is a screen, not the
     // account default — otherwise every copy of a screened door loses it.
     \$('dnb-screen').checked = cloneSource ? !!cloneSource.hasScreen : INCLUDE_SCREEN_DEFAULT;
+    \$('dnb-tube').checked = cloneSource ? !!cloneSource.hasTube : INCLUDE_TUBE_DEFAULT;
+    // Always blank: the next door in a copy run needs its own tube number.
+    \$('dnb-tubeNumber').value = '';
+    setHint('dnb-tubeHint', (cloneSource && cloneSource.hasTube)
+      ? 'Enter this door\\u2019s own tube number.' : '', '');
+    tubeSetGridsEnabled(true);
     classUserSet = false;
     onSeriesChange();
     setDefaultDate();
@@ -5249,13 +5676,15 @@ var GNYDNB = (function(){
     for (var k in acTimers) clearTimeout(acTimers[k]);
     acTimers = {};
 
-    for (var i=0;i<ALL_FAMILIES.length;i++){
-      var f = ALL_FAMILIES[i];
+    for (var i=0;i<ALL_UNITS.length;i++){
+      var f = ALL_UNITS[i];
       var revRow = \$('dnb-editRev-' + f);
       if (revRow) revRow.style.display = 'none';
       var card = \$('dnb-card-' + f);
-      if (card && f === 'S') card.style.display = \$('dnb-screen').checked ? '' : 'none';
-      else if (card) card.style.display = '';
+      if (!card) continue;
+      if (f === 'S') card.style.display = \$('dnb-screen').checked ? '' : 'none';
+      else if (f === 'T') card.style.display = \$('dnb-tube').checked ? '' : 'none';
+      else card.style.display = '';
     }
 
     // A copy run outranks the picker. The whole point is a set of near
@@ -5299,6 +5728,7 @@ var GNYDNB = (function(){
     \$('dnb-class').innerHTML = optionsHtml(CLASSES,'id','name','— none —');
     \$('dnb-autoIssue').checked = AUTO_ISSUE_DEFAULT;
     \$('dnb-screen').checked = INCLUDE_SCREEN_DEFAULT;
+    \$('dnb-tube').checked = INCLUDE_TUBE_DEFAULT;
     \$('dnb-submit').onclick = submit;
     setDefaultDate();
 
@@ -5310,6 +5740,7 @@ var GNYDNB = (function(){
       'Blank form — pick a template to fill the grids.', '');
     if (!ALLOW_TEMPLATE_CREATION) \$('dnb-newTplBtn').style.display = 'none';
     if (INCLUDE_SCREEN_DEFAULT) \$('dnb-card-S').style.display = '';
+    if (INCLUDE_TUBE_DEFAULT) \$('dnb-card-T').style.display = '';
 
     // The preselected template's payload rode down with the page, so the form
     // arrives filled rather than empty-then-populated.
@@ -5333,6 +5764,7 @@ var GNYDNB = (function(){
     \$('dnb-rev').addEventListener('change', function(){ refreshNumbers(); updatePreview(); });
     \$('dnb-number').addEventListener('input', onNumberInput);
     \$('dnb-number').addEventListener('blur', checkNumber);
+    \$('dnb-tubeNumber').addEventListener('input', checkTubeNumber);
     \$('dnb-desc').addEventListener('input', function(){
       // A textarea accepts Enter and pasted line breaks. This text is written
       // to four item records, so a newline must never survive the box.
@@ -5432,6 +5864,7 @@ var GNYDNB = (function(){
     previewTemplateName: previewTemplateName,
     submitTemplate: submitTemplate,
     toggleScreen: toggleScreen,
+    toggleTube: toggleTube,
     clearForm: clearForm,
     clearRecent: clearRecent,
     submit: submit,
