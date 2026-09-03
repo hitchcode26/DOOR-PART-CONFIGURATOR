@@ -3259,6 +3259,8 @@ ${hideTitle}
 /* The tube number is typed, not derived, so it gets a real field at the top
    of its card rather than the read-only derived line the others show. */
 #${WRAP} .tube-num{max-width:340px;margin-bottom:12px}
+/* Core-level option, on the core card because that is the level it changes. */
+#${WRAP} .core-opt{display:inline-flex;margin:0 0 10px}
 #${WRAP} .cut-wrap{margin-top:10px}
 #${WRAP} .cut-wrap textarea{min-height:64px}
 #${WRAP} .cut-wrap label .dim{text-transform:none;letter-spacing:0;font-family:var(--dnb-font);font-size:10px}
@@ -3612,10 +3614,6 @@ ${warnBanner}
               <input type="checkbox" class="chk" id="dnb-screen" onchange="GNYDNB.toggleScreen()">
               Include screen door
             </label>
-            <label class="inline-lbl">
-              <input type="checkbox" class="chk" id="dnb-tube" onchange="GNYDNB.toggleTube()">
-              Include tube frame <span class="dim">(on the core)</span>
-            </label>
           </div>
         </div>
       </div>
@@ -3661,7 +3659,11 @@ ${warnBanner}
 
 ${famCard('F', 3, 'Outer extrusion, seal, hinges. Cut then weld, or cut then bend.')}
 ${famCard('C', 4, 'Inner extrusion, skins, foam, adhesive, hardware. Cut, laminate, route.',
-  '<div class="sub-lines" id="dnb-subLines-C" style="display:none"></div>')}
+  `<label class="inline-lbl core-opt">
+     <input type="checkbox" class="chk" id="dnb-tube" onchange="GNYDNB.toggleTube()">
+     Include tube frame
+   </label>
+   <div class="sub-lines" id="dnb-subLines-C" style="display:none"></div>`)}
 ${famCard('T', 5, 'Tube extrusion, sometimes a sheet of .125 aluminium. Cut then weld.',
   `<div class="tube-num">
      <label for="dnb-tubeNumber">Tube frame number</label>
