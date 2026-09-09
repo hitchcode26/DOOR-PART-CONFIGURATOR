@@ -372,9 +372,21 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
     // 6 of 5,588 sub-assemblies do, which is drift, not a convention).
     CUT_DETAILS_FIELD: 'custitemcut_details',
 
-    // Door line / product line. Populated on only 209 doors, so it is offered
-    // but never required.
+    // Door line / product line. A List/Record field (CUSTOMLIST_DOOR_LINE),
+    // not free text — every live value is one of the 5 rows below. Populated
+    // on only 209 doors, so it is offered but never required.
     DOOR_LINE_FIELD: 'custitem_door_line',
+
+    // Read straight from customlist_door_line. Bump this by hand if a value
+    // is added or renamed in NetSuite — it isn't queried live, to avoid a
+    // round trip on every page load for a 5-row list that rarely changes.
+    DOOR_LINE_VALUES: [
+      { id: '1', name: 'Radius Bag' },
+      { id: '2', name: 'Square Bag' },
+      { id: '3', name: 'Square Entry' },
+      { id: '4', name: 'Specialty' },
+      { id: '5', name: 'Radius Entry' }
+    ],
 
     // Door-only Purchase Price. Confirmed live: populated on 3,229 of 3,256
     // DR items and essentially never on F-/C-/S- (16 of 1,198 frames, drift,
@@ -3200,6 +3212,14 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
                        ' &nbsp; ' + escHtml(s.cls) + '</option>';
     }
 
+    // Door line dropdown — a real NetSuite list (CUSTOMLIST_DOOR_LINE), not
+    // free text, so the values come straight from CFG.DOOR_LINE_VALUES rather
+    // than being typed.
+    let doorLineOptions = '<option value="">— none —</option>';
+    for (const d of (CFG.DOOR_LINE_VALUES || [])) {
+      doorLineOptions += '<option value="' + escHtml(d.id) + '">' + escHtml(d.name) + '</option>';
+    }
+
     // One card per sub-assembly family, generated so frame/core/screen stay
     // structurally identical and can't drift apart by hand-editing.
     function famCard(f, n, note, extraTop) {
@@ -3679,7 +3699,7 @@ ${warnBanner}
         <div class="grid gauto" style="margin-top:10px">
           <div>
             <label for="dnb-doorLine">Door line <span class="dim">— door only</span></label>
-            <input id="dnb-doorLine" autocomplete="off" placeholder="rarely needed">
+            <select id="dnb-doorLine">${doorLineOptions}</select>
           </div>
           <div>
             <label for="dnb-purchasePrice">Purchase price <span class="dim">— door only</span></label>
