@@ -376,6 +376,12 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
     // but never required.
     DOOR_LINE_FIELD: 'custitem_door_line',
 
+    // Door-only Purchase Price. Confirmed live: populated on 3,229 of 3,256
+    // DR items and essentially never on F-/C-/S- (16 of 1,198 frames, drift,
+    // not a convention) — same shape as CUT_DETAILS_FIELD, so it's handled
+    // the same way: entered once on the door, never on the sub-assemblies.
+    PURCHASE_PRICE_FIELD: 'custitemadv_purchaseprice',
+
     // Auto-Issue on BOM revision components. The sublist field ID varies by
     // account; candidates are tried in order and the one that sticks is
     // reused for the remaining lines.
@@ -407,9 +413,9 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
       'onhandvaluemli', 'totalvalue', 'averagecost', 'lastpurchaseprice',
       'costestimate', 'reorderpoint', 'preferredstocklevel',
       'buildtime', 'totalquantityonhand',
-      // Door-specific: the cut list and door line belong to ONE door, not to
-      // every door cloned off the template.
-      'custitemcut_details', 'custitem_door_line'
+      // Door-specific: the cut list, door line and purchase price belong to
+      // ONE door, not to every door cloned off the template.
+      'custitemcut_details', 'custitem_door_line', 'custitemadv_purchaseprice'
     ],
 
     // Door work centers are entity GROUPS with grouptype 'Employee' — the
@@ -1521,6 +1527,7 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
     out.classId = dr.classId || '';
     out.cutDetails = dr.cutDetails || '';
     out.doorLine = dr.doorLine || '';
+    out.purchasePrice = dr.purchasePrice || '';
     out.hasScreen = !!out.families.S;
 
     // Split the door's own BOM into the sub-assembly lines (which this tool
@@ -1610,6 +1617,7 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
       classId: safeGet(item, 'class'),
       cutDetails: safeGet(item, CFG.CUT_DETAILS_FIELD),
       doorLine: safeGet(item, CFG.DOOR_LINE_FIELD),
+      purchasePrice: safeGet(item, CFG.PURCHASE_PRICE_FIELD),
       components: [],
       steps: [],
       bomId: '', bomName: '', revId: '', revName: '', revEffectiveStart: null,
@@ -1632,7 +1640,7 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
     }
 
     if (!bomId) {
-      warnings.push(partNum + ' has no BOM attached — its lines cannot be edited here.');
+      warnings.push(partNum + ' has no BOM attached — one will be built for it when this door is saved.');
       return unit;
     }
     unit.bomId = bomId;
@@ -1665,7 +1673,7 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
       return unit;
     }
     if (!revisions.length) {
-      warnings.push(partNum + '\u2019s BOM has no active revisions.');
+      warnings.push(partNum + '\u2019s BOM has no active revisions — a new one will be built when this door is saved.');
       return unit;
     }
 
@@ -1782,6 +1790,7 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
       classId: o.classId,
       cutDetails: o.cutDetails,
       doorLine: o.doorLine,
+      purchasePrice: o.purchasePrice,
       bomId: bomId,
       out: itemOut
     });
@@ -2053,6 +2062,7 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
 
       const cutDetails = String(p.cutDetails == null ? '' : p.cutDetails);
       const doorLine = p.doorLine ? String(p.doorLine).trim() : '';
+      const purchasePrice = p.purchasePrice != null ? String(p.purchasePrice).trim() : '';
 
       // ── 1. The tube frame, before anything else ────────────────────────
       // It goes first because the CORE's BOM consumes it, and the core cannot
@@ -2075,6 +2085,7 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
             subsidiaryId, locationId, classId,
             cutDetails: '',    // the cut list lives on the door only
             doorLine: doorLine,
+            purchasePrice: '', // purchase price lives on the door only
             components: (tf.components || []).filter(c => c.itemId),
             steps: (tf.steps || []).filter(st => st.operationName),
             effectiveDate,
@@ -2111,6 +2122,7 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
           subsidiaryId, locationId, classId,
           cutDetails: '',     // the cut list lives on the door only
           doorLine: doorLine,
+          purchasePrice: '', // purchase price lives on the door only
           components: comps,
           steps: (fam.steps || []).filter(s => s.operationName),
           effectiveDate,
@@ -2147,6 +2159,7 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
         subsidiaryId, locationId, classId,
         cutDetails: cutDetails,
         doorLine: doorLine,
+        purchasePrice: purchasePrice,
         components: drComponents,
         steps: [],           // doors have no routing, by design
         effectiveDate,
@@ -2370,6 +2383,13 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
     if (o.doorLine && CFG.DOOR_LINE_FIELD) {
       try { item.setValue({ fieldId: CFG.DOOR_LINE_FIELD, value: o.doorLine }); applied.push('door line'); }
       catch (e) { log.audit({ title: 'door line set failed', details: e.toString() }); }
+    }
+    if (o.purchasePrice && CFG.PURCHASE_PRICE_FIELD) {
+      const pp = parseFloat(o.purchasePrice);
+      if (!isNaN(pp)) {
+        try { item.setValue({ fieldId: CFG.PURCHASE_PRICE_FIELD, value: pp }); applied.push('purchase price'); }
+        catch (e) { log.audit({ title: 'purchase price set failed', details: e.toString() }); }
+      }
     }
 
     o.out.item = { name: o.partNum, family: o.family, descriptionFields: descFields, fields: applied };
@@ -2626,6 +2646,7 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
           classId: p.classId,
           cutDetails: (f === 'DR') ? p.cutDetails : null,
           doorLine: p.doorLine,
+          purchasePrice: (f === 'DR') ? p.purchasePrice : null,
           autoIssue: p.autoIssue,
           asNewRev: asNewRev,
           done: done
@@ -2668,16 +2689,59 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
     if (o.doorLine && CFG.DOOR_LINE_FIELD) {
       try { item.setValue({ fieldId: CFG.DOOR_LINE_FIELD, value: o.doorLine }); } catch (e) { /* n/a */ }
     }
+    if (o.purchasePrice !== null && o.purchasePrice !== undefined && o.purchasePrice !== '' &&
+        CFG.PURCHASE_PRICE_FIELD) {
+      const pp = parseFloat(o.purchasePrice);
+      if (!isNaN(pp)) {
+        try { item.setValue({ fieldId: CFG.PURCHASE_PRICE_FIELD, value: pp }); } catch (e) { /* n/a */ }
+      }
+    }
+
+    // A family loaded with no BOM at all (item exists, nothing attached) gets
+    // one built now instead of being silently skipped. Before this fix, a
+    // frame or core opened with no BOM would save its item fields above and
+    // then hit "no revision loaded" below and stop — the missing BOM layer
+    // was never created, on this save or any later one.
+    let builtBom = false;
+    if (!fam.bomId) {
+      const subVal = item.getValue({ fieldId: 'subsidiary' });
+      const subsidiaryId = Array.isArray(subVal) ? subVal[0] : subVal;
+      const bomName = fam.partNumber + ' BOM';
+      const newBomId = createBom(bomName, subsidiaryId);
+      item.setSublistValue({ sublistId: 'billofmaterials', fieldId: 'billofmaterials', line: 0, value: newBomId });
+      item.setSublistValue({ sublistId: 'billofmaterials', fieldId: 'masterdefault', line: 0, value: true });
+      fam.bomId = newBomId;
+      builtBom = true;
+      out.bomCreated = { id: newBomId, name: bomName };
+      o.done.push(label + ' BOM created');
+    }
+
     item.save({ ignoreMandatoryFields: false, enableSourcing: CFG.ENABLE_SOURCING });
     o.done.push(label + ' item fields');
     out.itemSaved = true;
 
-    // ── 2. Routing steps, in place ─────────────────────────────────────
-    // Routing is not versioned by BOM revision in this data model (one routing
-    // record per BOM), so both save paths update it the same way.
+    if (builtBom && CFG.RESTRICT_BOM_TO_ASSEMBLY) {
+      out.bomCreated.restricted = restrictBomToAssembly(fam.bomId, fam.itemId);
+    }
+
+    // ── 2. Routing steps ────────────────────────────────────────────────
     const steps = CFG.BUILDS_ROUTING[f] ? (fam.steps || []).filter(s => s.operationName) : [];
     const newSeqs = steps.map(st => parseInt(st.sequence, 10)).filter(n => !isNaN(n));
-    if (fam.routingId && steps.length) {
+
+    if (!fam.routingId && CFG.BUILDS_ROUTING[f] && steps.length) {
+      // No routing existed either — same situation as the missing BOM, so it
+      // gets built the same way a brand-new door's routing would.
+      const routingName = fam.partNumber + ' ROUTING';
+      const routing = record.create({ type: record.Type.MANUFACTURING_ROUTING, isDynamic: false });
+      routing.setValue({ fieldId: 'name', value: routingName });
+      routing.setValue({ fieldId: 'billofmaterials', value: fam.bomId });
+      routing.setValue({ fieldId: 'isdefault', value: true });
+      writeRoutingSteps(routing, steps);
+      const routingId = routing.save({ enableSourcing: CFG.ENABLE_SOURCING });
+      fam.routingId = routingId;
+      out.routing = { id: routingId, steps: steps.length, created: true };
+      o.done.push(label + ' routing created (' + steps.length + ' step(s))');
+    } else if (fam.routingId && steps.length) {
       const routing = record.load({ type: record.Type.MANUFACTURING_ROUTING, id: fam.routingId, isDynamic: false });
       const existingLines = routing.getLineCount({ sublistId: 'routingstep' });
 
@@ -2703,15 +2767,28 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
       o.done.push(label + ' routing (' + steps.length + ' step(s))');
     }
 
-    // ── 3. Components — in place, or on a new revision ──────────────────
+    // ── 3. Components — new BOM/revision gets a fresh one; existing BOM
+    //      follows the normal in-place / new-revision logic ─────────────
     // The door's sub-assembly lines are rebuilt from the loaded family rather
     // than from the grid, so nobody can accidentally drop the frame or core
     // out of the door by clearing a row.
     const components = (fam.subLines || []).filter(c => c.itemId)
       .concat((fam.components || []).filter(c => c.itemId));
 
-    if (!fam.revId) {
-      out.revision = { skipped: true, reason: 'no revision loaded' };
+    if (builtBom || !fam.revId) {
+      // Either the BOM itself is brand new, or it existed with no active
+      // revision — either way there is nothing to update in place, so the
+      // first revision is created instead of being skipped.
+      const revLetter = 'A';
+      const revName = fam.partNumber + CFG.REV_NAME_SEP[f] + revLetter;
+      const rev = record.create({ type: record.Type.BOM_REVISION, isDynamic: false });
+      rev.setValue({ fieldId: 'billofmaterials', value: fam.bomId });
+      rev.setValue({ fieldId: 'name', value: revName });
+      rev.setValue({ fieldId: 'effectivestartdate', value: offsetDate(CFG.EFFECTIVE_DATE_OFFSET_DAYS) });
+      writeRevisionComponents(rev, components, o.autoIssue);
+      const revId = rev.save({ enableSourcing: CFG.ENABLE_SOURCING });
+      out.revision = { id: revId, name: revName, lines: components.length, created: true };
+      o.done.push(label + ' revision created (' + components.length + ' line(s))');
       return out;
     }
 
@@ -3582,7 +3659,7 @@ ${warnBanner}
          it does not compete with the fields that actually vary. -->
     <details class="more" id="dnb-more">
       <summary>More options
-        <span class="dim">class · revision · effective date · screen door · auto-issue</span>
+        <span class="dim">class · revision · effective date · screen door · auto-issue · door line · purchase price</span>
       </summary>
       <div class="more-body">
         <div class="grid gauto">
@@ -3597,6 +3674,16 @@ ${warnBanner}
               <input type="checkbox" class="chk" id="dnb-autoIssue" tabindex="-1">
               Auto-issue components
             </label>
+          </div>
+        </div>
+        <div class="grid gauto" style="margin-top:10px">
+          <div>
+            <label for="dnb-doorLine">Door line <span class="dim">— door only</span></label>
+            <input id="dnb-doorLine" autocomplete="off" placeholder="rarely needed">
+          </div>
+          <div>
+            <label for="dnb-purchasePrice">Purchase price <span class="dim">— door only</span></label>
+            <input id="dnb-purchasePrice" autocomplete="off" inputmode="decimal" placeholder="0.00">
           </div>
         </div>
         <div class="grid gauto" style="margin-top:10px" id="dnb-newOnlyRow">
@@ -3675,7 +3762,7 @@ ${famCard('S', 6, 'Screen frame extrusion, mesh, hardware. Usually cut only.')}
 
 <div class="actions">
   <button type="button" class="btn-primary tabstop" id="dnb-submit" onclick="GNYDNB.submit()">Create door</button>
-  <button type="button" class="btn-secondary tabstop" id="dnb-newRevBtn" style="display:none" onclick="GNYDNB.submitNewRev()">Save as new BOM revs</button>
+  <button type="button" class="btn-secondary tabstop" id="dnb-newRevBtn" style="display:none" onclick="GNYDNB.submitNewRev()">Save as new BOM revisions</button>
 
   <div class="preview" id="dnb-preview"></div>
 </div>
@@ -4164,6 +4251,8 @@ var GNYDNB = (function(){
     \$('dnb-desc').value = r.description;
     \$('dnb-class').value = r.classId || '';
     \$('dnb-cut').value = r.cutDetails || '';
+    \$('dnb-doorLine').value = r.doorLine || '';
+    \$('dnb-purchasePrice').value = r.purchasePrice || '';
     \$('dnb-screen').checked = !!r.hasScreen;
     \$('dnb-tube').checked = !!r.hasTube;
     \$('dnb-tubeNumber').value = r.tubeNumber || '';
@@ -4265,7 +4354,8 @@ var GNYDNB = (function(){
     \$('dnb-editBanner').textContent =
       'Update Fields saves item fields, routing and the CURRENT revisions in place. ' +
       'Save As New BOM Revs closes each current revision and opens a new one dated yesterday. ' +
-      'Routing is not versioned by revision in this account, so it always saves in place.' + warn;
+      'Routing is not versioned by revision in this account, so it always saves in place. ' +
+      'A frame or core loaded with no BOM at all gets one built the next time you save.' + warn;
     \$('dnb-editBanner').classList.add('open');
 
     refreshNumbers();
@@ -4668,6 +4758,8 @@ var GNYDNB = (function(){
       description: String(editData.description || '')
                      .replace(/^\\s*TEMPLATE\\s*[-:]?\\s*/i, '').trim(),
       cutDetails: editData.cutDetails || '',
+      doorLine: editData.doorLine || '',
+      purchasePrice: editData.purchasePrice || '',
       hasScreen: !!editData.families.S,
       // The tube's GRIDS carry over, its NUMBER never does. Engineering issues
       // one number per tube and every door gets its own, so reusing the source
@@ -4913,6 +5005,17 @@ var GNYDNB = (function(){
         (!gentle || templateOwned(\$('dnb-cut'), seededCut))){
       \$('dnb-cut').value = fill.cutDetails;
       seededCut = \$('dnb-cut').value;
+    }
+    // Door line and purchase price are never seeded from a TEMPLATE (they are
+    // per-door values, not part of a reusable setup — loadTemplateFill never
+    // sets these keys). Copying a real door is different: cloneFillFromEdit
+    // does set them, and !gentle there means they carry straight over as a
+    // starting point for the next size, same as the cut list does.
+    if (fill.doorLine !== undefined && !gentle){
+      \$('dnb-doorLine').value = fill.doorLine || '';
+    }
+    if (fill.purchasePrice !== undefined && !gentle){
+      \$('dnb-purchasePrice').value = fill.purchasePrice || '';
     }
 
     for (var i=0;i<ALL_UNITS.length;i++){
@@ -5206,6 +5309,8 @@ var GNYDNB = (function(){
       description: desc,
       classId: \$('dnb-class').value,
       cutDetails: \$('dnb-cut').value,
+      doorLine: \$('dnb-doorLine').value.trim(),
+      purchasePrice: \$('dnb-purchasePrice').value.trim(),
       includeScreen: \$('dnb-screen').checked,
       includeTube: \$('dnb-tube').checked,
       tubeNumber: \$('dnb-tubeNumber').value.trim(),
@@ -5270,6 +5375,8 @@ var GNYDNB = (function(){
       description: desc,
       classId: \$('dnb-class').value,
       cutDetails: \$('dnb-cut').value,
+      doorLine: \$('dnb-doorLine').value.trim(),
+      purchasePrice: \$('dnb-purchasePrice').value.trim(),
       includeScreen: \$('dnb-screen').checked,
       includeTube: \$('dnb-tube').checked,
       tubeNumber: \$('dnb-tubeNumber').value.trim(),
@@ -5315,6 +5422,8 @@ var GNYDNB = (function(){
       description: desc,
       classId: \$('dnb-class').value,
       cutDetails: \$('dnb-cut').value,
+      doorLine: \$('dnb-doorLine').value.trim(),
+      purchasePrice: \$('dnb-purchasePrice').value.trim(),
       autoIssue: \$('dnb-autoIssue').checked,
       families: {}
     };
@@ -5367,7 +5476,7 @@ var GNYDNB = (function(){
     var btn = \$('dnb-submit'), revBtn = \$('dnb-newRevBtn');
     btn.disabled = true; revBtn.disabled = true; revBtn.textContent = 'Saving…';
     postJson(payload, function(r){
-      btn.disabled = false; revBtn.disabled = false; revBtn.textContent = 'Save as new BOM revs';
+      btn.disabled = false; revBtn.disabled = false; revBtn.textContent = 'Save as new BOM revisions';
       if (r.ok) showEditSuccess(r); else showError(r.message, null, r.alreadySaved);
     });
   }
@@ -5433,17 +5542,22 @@ var GNYDNB = (function(){
       var f = ALL_UNITS[i], u = r.families[f];
       if (!u) continue;
       h += '<li>' + esc(u.partNumber);
+      if (u.bomCreated){
+        h += ' &middot; <a href="/app/manufacturing/billofmaterials.nl?id=' + u.bomCreated.id +
+             '" target="_blank">new BOM</a>';
+      }
       if (u.closedRevision){
         h += ' &middot; closed ' + esc(u.closedRevision.name) +
              ' (end ' + esc(new Date(u.closedRevision.effectiveEnd).toLocaleDateString()) + ')';
       }
       if (u.revision && !u.revision.skipped){
-        h += ' &middot; ' + (u.revision.replaced ? 'opened ' : 'updated ') + esc(u.revision.name) +
+        var revWord = u.revision.created ? 'created ' : (u.revision.replaced ? 'opened ' : 'updated ');
+        h += ' &middot; ' + revWord + esc(u.revision.name) +
              ' (' + u.revision.lines + ' line(s))';
         if (u.revision.note) h += ' <span class="dim">' + esc(u.revision.note) + '</span>';
       }
       if (u.routing){
-        h += ' &middot; routing ' + u.routing.steps + ' step(s)';
+        h += ' &middot; routing ' + (u.routing.created ? 'created, ' : '') + u.routing.steps + ' step(s)';
         if (u.routing.remapped && u.routing.remapped.length){
           var moves = u.routing.remapped.map(function(m){
             return m.revision + ' line ' + m.line + ': op ' + m.from + ' \\u2192 ' + m.to;
@@ -5659,6 +5773,10 @@ var GNYDNB = (function(){
     doorAcClose();
     \$('dnb-desc').value = '';
     \$('dnb-cut').value = '';
+    // Cleared unless a copy run is what's driving this reset — see below,
+    // where cloneSource's own values are re-applied straight after.
+    \$('dnb-doorLine').value = '';
+    \$('dnb-purchasePrice').value = '';
     \$('dnb-rev').value = 'A';
     \$('dnb-autoIssue').checked = AUTO_ISSUE_DEFAULT;
     // Mid-copy the source door decides whether there is a screen, not the
