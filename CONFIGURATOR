@@ -3371,6 +3371,10 @@ ${hideTitle}
 #${WRAP} .row-main > *{min-width:0}
 @media(max-width:560px){#${WRAP} .row-main{grid-template-columns:1fr}}
 
+/* Always-open now — no toggle, so it just needs breathing room above and
+   below to read as its own group between Number/Series and Description. */
+#${WRAP} .more-options{margin:14px 0;padding-top:12px;border-top:1px dashed var(--dnb-border)}
+
 #${WRAP} .desc-wrap{margin-top:2px}
 /* Overrides the 96px floor every other textarea here wants — this one starts
    at two lines and grows to fit what is in it. */
@@ -3666,6 +3670,57 @@ ${warnBanner}
       </div>
     </div>
 
+    <!-- Always visible now, not a click away — class, door line and purchase
+         price change less often than the description but still need to be
+         set before most doors, so they sit right after Number/Series and
+         before Description rather than folded under a toggle. Three columns
+         so the whole set costs as few rows as possible. -->
+    <div class="more-options">
+      <div class="sub-label" style="margin-top:0">More options</div>
+      <div class="grid g3">
+        <div>
+          <label for="dnb-class">Class</label>
+          <select id="dnb-class"${skipTab}></select>
+          <div class="hint" id="dnb-classHint">&nbsp;</div>
+        </div>
+        <div>
+          <label for="dnb-doorLine">Door line <span class="dim">— door only</span></label>
+          <select id="dnb-doorLine">${doorLineOptions}</select>
+        </div>
+        <div>
+          <label for="dnb-purchasePrice">Purchase price <span class="dim">— door only</span></label>
+          <input id="dnb-purchasePrice" autocomplete="off" inputmode="decimal" placeholder="0.00">
+        </div>
+        <div>
+          <label>&nbsp;</label>
+          <label class="inline-lbl">
+            <input type="checkbox" class="chk" id="dnb-autoIssue" tabindex="-1">
+            Auto-issue components
+          </label>
+        </div>
+      </div>
+      <!-- New-door-only, so hidden as one block while editing an existing
+           door — revision letter, effective date and whether to include a
+           screen only mean anything when a family is about to be built. -->
+      <div class="grid g3" style="margin-top:10px" id="dnb-newOnlyRow">
+        <div>
+          <label for="dnb-rev">Revision</label>
+          <select id="dnb-rev"${skipTab}></select>
+        </div>
+        <div>
+          <label for="dnb-date">Revision effective date</label>
+          <input id="dnb-date" autocomplete="off"${skipTab}>
+        </div>
+        <div>
+          <label>&nbsp;</label>
+          <label class="inline-lbl">
+            <input type="checkbox" class="chk" id="dnb-screen" onchange="GNYDNB.toggleScreen()">
+            Include screen door
+          </label>
+        </div>
+      </div>
+    </div>
+
     <!-- Full width and WRAPPING. These run well past 130 characters — the
          4000 template's is 134 — and a one-line input turns that into a
          horizontal scroll where you cannot see the size and the hinge hand at
@@ -3696,59 +3751,6 @@ ${warnBanner}
       <label for="dnb-cut">Cut details <span class="dim">— door only</span></label>
       <textarea id="dnb-cut" rows="3" tabindex="-1" placeholder="(Outer W - )&#10;(Outer H - )&#10;(Inner W - )&#10;(Inner H - )&#10;(Panel W - )&#10;(Panel H - )&#10;(H-Bar - )"></textarea>
     </div>
-
-    <!-- Everything below is set correctly on its own for nearly every door:
-         class from the series, revision A, effective date yesterday, no
-         screen, auto-issue on. It is here for the exceptions, folded away so
-         it does not compete with the fields that actually vary. -->
-    <details class="more" id="dnb-more">
-      <summary>More options
-        <span class="dim">class · revision · effective date · screen door · auto-issue · door line · purchase price</span>
-      </summary>
-      <div class="more-body">
-        <div class="grid gauto">
-          <div>
-            <label for="dnb-class">Class</label>
-            <select id="dnb-class"${skipTab}></select>
-            <div class="hint" id="dnb-classHint">&nbsp;</div>
-          </div>
-          <div>
-            <label>&nbsp;</label>
-            <label class="inline-lbl">
-              <input type="checkbox" class="chk" id="dnb-autoIssue" tabindex="-1">
-              Auto-issue components
-            </label>
-          </div>
-        </div>
-        <div class="grid gauto" style="margin-top:10px">
-          <div>
-            <label for="dnb-doorLine">Door line <span class="dim">— door only</span></label>
-            <select id="dnb-doorLine">${doorLineOptions}</select>
-          </div>
-          <div>
-            <label for="dnb-purchasePrice">Purchase price <span class="dim">— door only</span></label>
-            <input id="dnb-purchasePrice" autocomplete="off" inputmode="decimal" placeholder="0.00">
-          </div>
-        </div>
-        <div class="grid gauto" style="margin-top:10px" id="dnb-newOnlyRow">
-          <div>
-            <label for="dnb-rev">Revision</label>
-            <select id="dnb-rev"${skipTab}></select>
-          </div>
-          <div>
-            <label for="dnb-date">Revision effective date</label>
-            <input id="dnb-date" autocomplete="off"${skipTab}>
-          </div>
-          <div>
-            <label>&nbsp;</label>
-            <label class="inline-lbl">
-              <input type="checkbox" class="chk" id="dnb-screen" onchange="GNYDNB.toggleScreen()">
-              Include screen door
-            </label>
-          </div>
-        </div>
-      </div>
-    </details>
   </div>
 </div>
 
