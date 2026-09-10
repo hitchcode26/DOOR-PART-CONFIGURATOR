@@ -2635,14 +2635,19 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
         const fam = inbound[f];
         const comps = (fam.components || []).filter(c => c.itemId);
         const subs = (fam.subLines || []).filter(c => c.itemId);
-        if (!comps.length && !subs.length) {
+        // A family with an existing BOM being emptied out is a real mistake
+        // and stays blocked. A family with NO BOM and nothing on its grid is
+        // not ready to build one yet — that's fine; its item fields (door
+        // line, class, cut details, purchase price) still save below, and
+        // the BOM waits until components are actually added.
+        if (!comps.length && !subs.length && fam.bomId) {
           throw new Error(FAMILY_LABEL[f] + ' has no components.');
         }
         if (CFG.BUILDS_ROUTING[f]) {
           const steps = (fam.steps || []).filter(s => s.operationName);
           validateSequences(steps, FAMILY_LABEL[f]);
         }
-        if (asNewRev) {
+        if (asNewRev && fam.bomId) {
           const nm = String(fam.newRevName || '').trim();
           if (!nm) throw new Error(FAMILY_LABEL[f] + ' needs a name for its new revision.');
           if (normName(nm) === normName(fam.revName)) {
@@ -2714,8 +2719,27 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
     // frame or core opened with no BOM would save its item fields above and
     // then hit "no revision loaded" below and stop — the missing BOM layer
     // was never created, on this save or any later one.
+    //
+    // Components are collected up front because whether there's anything to
+    // build a BOM FROM decides which of the two paths below actually runs.
+    const components = (fam.subLines || []).filter(c => c.itemId)
+      .concat((fam.components || []).filter(c => c.itemId));
+    const hadBom = !!fam.bomId;
+
+    // No BOM and nothing on the grid to build one from — not ready yet. Save
+    // just the item fields (door line, class, cut details, purchase price)
+    // and stop here rather than forcing an empty BOM into existence. Add
+    // components to this family's grid on a later save to build it for real.
+    if (!hadBom && !components.length) {
+      item.save({ ignoreMandatoryFields: false, enableSourcing: CFG.ENABLE_SOURCING });
+      o.done.push(label + ' item fields (no BOM yet — add components to build one)');
+      out.itemSaved = true;
+      out.revision = { skipped: true, reason: 'no BOM and no components to build one from' };
+      return out;
+    }
+
     let builtBom = false;
-    if (!fam.bomId) {
+    if (!hadBom) {
       const subVal = item.getValue({ fieldId: 'subsidiary' });
       const subsidiaryId = Array.isArray(subVal) ? subVal[0] : subVal;
       const bomName = fam.partNumber + ' BOM';
@@ -2783,9 +2807,9 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
     //      follows the normal in-place / new-revision logic ─────────────
     // The door's sub-assembly lines are rebuilt from the loaded family rather
     // than from the grid, so nobody can accidentally drop the frame or core
-    // out of the door by clearing a row.
-    const components = (fam.subLines || []).filter(c => c.itemId)
-      .concat((fam.components || []).filter(c => c.itemId));
+    // out of the door by clearing a row. `components` was already computed
+    // above, before the item save, since it decides whether a BOM gets built
+    // at all.
 
     if (builtBom || !fam.revId) {
       // Either the BOM itself is brand new, or it existed with no active
