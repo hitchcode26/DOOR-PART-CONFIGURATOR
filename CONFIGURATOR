@@ -388,11 +388,17 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
       { id: '5', name: 'Radius Entry' }
     ],
 
-    // Door-only Purchase Price. Confirmed live: populated on 3,229 of 3,256
-    // DR items and essentially never on F-/C-/S- (16 of 1,198 frames, drift,
-    // not a convention) — same shape as CUT_DETAILS_FIELD, so it's handled
-    // the same way: entered once on the door, never on the sub-assemblies.
-    PURCHASE_PRICE_FIELD: 'custitemadv_purchaseprice',
+    // Door-only Purchase Price. Confirmed by field help on the item form
+    // (right-click "Purchase Price" -> Field ID: cost) — the STANDARD field,
+    // not the custitemadv_purchaseprice custom field this was pointed at
+    // before. That mismatch was a real bug: 'cost' was never excluded from
+    // template/copy inheritance, so every new or copied door silently
+    // inherited the SOURCE door's old cost value the normal way template
+    // fields do, while whatever was typed into the Purchase Price box wrote
+    // to the unused custom field and never showed up anywhere. Same shape as
+    // CUT_DETAILS_FIELD otherwise: entered once on the door, never on the
+    // sub-assemblies, and now correctly excluded from inheritance below.
+    PURCHASE_PRICE_FIELD: 'cost',
 
     // Auto-Issue on BOM revision components. The sublist field ID varies by
     // account; candidates are tried in order and the one that sticks is
@@ -426,8 +432,11 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
       'costestimate', 'reorderpoint', 'preferredstocklevel',
       'buildtime', 'totalquantityonhand',
       // Door-specific: the cut list, door line and purchase price belong to
-      // ONE door, not to every door cloned off the template.
-      'custitemcut_details', 'custitem_door_line', 'custitemadv_purchaseprice'
+      // ONE door, not to every door cloned off the template. 'cost' is the
+      // real Purchase Price field (see PURCHASE_PRICE_FIELD above) — leaving
+      // it off this list is exactly what let a source door's old price
+      // silently ride onto every copy regardless of what was typed.
+      'custitemcut_details', 'custitem_door_line', 'cost'
     ],
 
     // Door work centers are entity GROUPS with grouptype 'Employee' — the
@@ -3673,8 +3682,8 @@ ${warnBanner}
     <!-- Always visible now, not a click away — class, door line and purchase
          price change less often than the description but still need to be
          set before most doors, so they sit right after Number/Series and
-         before Description rather than folded under a toggle. Three columns
-         so the whole set costs as few rows as possible. -->
+         before Description rather than folded under a toggle. Two rows of
+         three columns is as tight as this gets without losing a field. -->
     <div class="more-options">
       <div class="sub-label" style="margin-top:0">More options</div>
       <div class="grid g3">
@@ -3691,29 +3700,29 @@ ${warnBanner}
           <label for="dnb-purchasePrice">Purchase price <span class="dim">— door only</span></label>
           <input id="dnb-purchasePrice" autocomplete="off" inputmode="decimal" placeholder="0.00">
         </div>
-        <div>
-          <label>&nbsp;</label>
-          <label class="inline-lbl">
-            <input type="checkbox" class="chk" id="dnb-autoIssue" tabindex="-1">
-            Auto-issue components
-          </label>
-        </div>
       </div>
-      <!-- New-door-only, so hidden as one block while editing an existing
-           door — revision letter, effective date and whether to include a
-           screen only mean anything when a family is about to be built. -->
-      <div class="grid g3" style="margin-top:10px" id="dnb-newOnlyRow">
-        <div>
+      <!-- Revision and effective date only mean anything for a family about
+           to be built, so those two cells hide individually while editing an
+           existing door (see .new-only class in the JS). Auto-issue applies
+           to Update Fields and New BOM Rev too, so it shares this row but
+           never hides — same for the screen-door checkbox living alongside it
+           rather than taking a cell of its own. -->
+      <div class="grid g3" style="margin-top:10px">
+        <div class="new-only">
           <label for="dnb-rev">Revision</label>
           <select id="dnb-rev"${skipTab}></select>
         </div>
-        <div>
+        <div class="new-only">
           <label for="dnb-date">Revision effective date</label>
           <input id="dnb-date" autocomplete="off"${skipTab}>
         </div>
         <div>
           <label>&nbsp;</label>
           <label class="inline-lbl">
+            <input type="checkbox" class="chk" id="dnb-autoIssue" tabindex="-1">
+            Auto-issue components
+          </label>
+          <label class="inline-lbl new-only" style="display:block;margin-top:6px">
             <input type="checkbox" class="chk" id="dnb-screen" onchange="GNYDNB.toggleScreen()">
             Include screen door
           </label>
@@ -3934,6 +3943,19 @@ var GNYDNB = (function(){
     if (!el) return;
     el.textContent = text || '\\u00A0';
     el.className = 'hint' + (cls ? ' ' + cls : '');
+  }
+
+  // Revision and effective date only mean anything for a family about to be
+  // built, and the screen-door checkbox sits right alongside Auto-issue in
+  // the same row rather than a cell of its own — so each hides individually
+  // by class rather than as one wrapping container, which would take
+  // Auto-issue down with it. Auto-issue applies to Update Fields and New BOM
+  // Rev too, so it must never be part of this toggle.
+  function setNewOnlyVisible(on){
+    var els = root ? root.querySelectorAll('.new-only') : document.querySelectorAll('.new-only');
+    for (var i=0;i<els.length;i++){
+      els[i].style.display = on ? '' : 'none';
+    }
   }
 
   function activeFamilies(){
@@ -4306,7 +4328,7 @@ var GNYDNB = (function(){
       ? 'Loaded from the core of ' + r.doorNumber + '.'
       : '', r.hasTube ? 'good' : '');
     tubeSetGridsEnabled(true);
-    \$('dnb-newOnlyRow').style.display = 'none';
+    setNewOnlyVisible(false);
     // Templates describe what a NEW door starts as. Applying one to a door
     // that already exists would silently replace its real BOM with a
     // template's, so the picker is locked out until you leave edit mode.
@@ -4416,7 +4438,7 @@ var GNYDNB = (function(){
     editData = null;
     \$('dnb-editBanner').classList.remove('open');
     \$('dnb-doorNote').textContent = DOOR_NOTE_NEW;
-    \$('dnb-newOnlyRow').style.display = '';
+    setNewOnlyVisible(true);
     \$('dnb-submit').textContent = 'Create door';
     \$('dnb-submit').onclick = submit;
     \$('dnb-newRevBtn').style.display = 'none';
@@ -5810,7 +5832,7 @@ var GNYDNB = (function(){
     numReqSeq++;   // abandon any checkdoor/loaddoor still in flight
     \$('dnb-editBanner').classList.remove('open');
     \$('dnb-doorNote').textContent = DOOR_NOTE_NEW;
-    \$('dnb-newOnlyRow').style.display = '';
+    setNewOnlyVisible(true);
     setTemplatePickerEnabled(true, '');
 
     \$('dnb-number').value = '';
