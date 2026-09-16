@@ -765,6 +765,7 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
       if (api === 'checkdoor')     return checkDoorNumber(params.term || '');
       if (api === 'loaddoor')      return loadDoorForEdit(params.term || '');
       if (api === 'doors')         return searchDoors(params.term || '');
+      if (api === 'partcopy')      return loadPartForCopy(params.term || '');
     } catch (e) {
       log.error({ title: 'api ' + api, details: e.toString() + ' | ' + (e.stack || '') });
     }
@@ -1765,6 +1766,40 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
     }
 
     return unit;
+  }
+
+  // Pulls just the BOM components and routing steps off ANY existing item, by
+  // part number, so a family with no BOM of its own — the exact scenario the
+  // "no BOM" fix above leaves the person to fill in — can start from a
+  // similar part's setup instead of building every row from scratch. The job
+  // left is adjusting quantities.
+  //
+  // Reuses loadFamilyUnit rather than re-implementing the BOM/revision/
+  // routing reads. Passing fam='F' (which has BUILDS_ROUTING true) forces the
+  // routing read regardless of what family the source item actually belongs
+  // to — harmless when the source has none (routing just comes back empty),
+  // and exactly what's needed when it does. Nothing about the source item is
+  // touched; this only reads.
+  function loadPartForCopy(term) {
+    const t = String(term || '').trim().toUpperCase();
+    if (!t) return { ok: false, message: 'Enter a part number.' };
+    const found = checkPartNumbers([t]);
+    const itemId = found[t];
+    if (!itemId) return { ok: false, message: t + ' was not found.' };
+
+    const warnings = [];
+    const unit = loadFamilyUnit('F', t, itemId, warnings);
+    if (!unit) return { ok: false, message: 'Could not read ' + t + '.' };
+    if (!unit.bomId) return { ok: false, message: t + ' has no BOM to copy from.' };
+
+    return {
+      ok: true,
+      partNumber: t,
+      components: unit.components || [],
+      steps: unit.steps || [],
+      bomName: unit.bomName || '',
+      revName: unit.revName || ''
+    };
   }
 
   function safeGet(item, fieldId) {
@@ -3267,6 +3302,15 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
     <div class="fam-num" id="dnb-num-${f}">&nbsp;</div>
     ${extraTop || ''}
 
+    <div class="copy-from-row">
+      <label for="dnb-copyFrom-${f}">Copy BOM/routing from</label>
+      <div class="copy-from-inline">
+        <input id="dnb-copyFrom-${f}" autocomplete="off" placeholder="a similar part number…">
+        <button type="button" class="btn-sm" onclick="GNYDNB.copyFromPart('${f}')">Fill</button>
+      </div>
+      <div class="hint" id="dnb-copyFromHint-${f}">&nbsp;</div>
+    </div>
+
     <div class="sub-label">Components</div>
     <div class="twrap comp-wrap">
     <table>
@@ -3395,6 +3439,12 @@ ${hideTitle}
 #${WRAP} .tube-num{max-width:340px;margin-bottom:12px}
 /* Core-level option, on the core card because that is the level it changes. */
 #${WRAP} .core-opt{display:inline-flex;margin:0 0 10px}
+/* One item's BOM and routing borrowed onto another — for a family with no
+   BOM of its own, or one worth re-basing off a similar part. */
+#${WRAP} .copy-from-row{margin-bottom:12px;padding-bottom:10px;border-bottom:1px dashed var(--dnb-border)}
+#${WRAP} .copy-from-row label{display:inline;margin-right:8px}
+#${WRAP} .copy-from-inline{display:flex;gap:8px;align-items:center;max-width:420px}
+#${WRAP} .copy-from-inline input{flex:1 1 auto}
 #${WRAP} .cut-wrap{margin-top:10px}
 #${WRAP} .cut-wrap textarea{min-height:64px}
 #${WRAP} .cut-wrap label .dim{text-transform:none;letter-spacing:0;font-family:var(--dnb-font);font-size:10px}
@@ -3770,6 +3820,22 @@ ${warnBanner}
   </div>
   <div class="card-body">
     <div class="fam-num" id="dnb-num-DR">&nbsp;</div>
+
+    <!-- Same control the sub-assembly cards carry, and the one that matters
+         most here: a door whose own BOM is missing has no frame/core cards on
+         screen to borrow from, so without this there was nowhere to copy a
+         setup in from. Only the LOOSE HARDWARE comes across — the door's own
+         frame/core/screen lines are re-derived from its number, never copied
+         off another door. -->
+    <div class="copy-from-row">
+      <label for="dnb-copyFrom-DR">Copy BOM from</label>
+      <div class="copy-from-inline">
+        <input id="dnb-copyFrom-DR" autocomplete="off" placeholder="a similar door number…">
+        <button type="button" class="btn-sm" onclick="GNYDNB.copyFromPart('DR')">Fill</button>
+      </div>
+      <div class="hint" id="dnb-copyFromHint-DR">&nbsp;</div>
+    </div>
+
     <div class="sub-lines" id="dnb-subLines"></div>
 
     <div class="sub-label">Loose hardware</div>
@@ -5108,6 +5174,64 @@ var GNYDNB = (function(){
     updatePreview();
   }
 
+  // Pulls just the BOM components and routing steps off an existing part and
+  // drops them into this family's grids — for a family with no BOM of its
+  // own (the tube/frame/core scenario the "no BOM" fix leaves you to fill
+  // in), or any family worth re-basing off a similar part instead of typing
+  // every row by hand. The job left is adjusting quantities.
+  function copyFromPart(fam){
+    var el = \$('dnb-copyFrom-' + fam);
+    var term = el ? el.value.trim() : '';
+    if (!term){ setHint('dnb-copyFromHint-' + fam, 'Enter a part number.', 'bad'); return; }
+
+    if ((rowCount[fam] || (BUILDS_ROUTING[fam] && stepCount[fam])) &&
+        !window.confirm('Replace the current ' +
+          (BUILDS_ROUTING[fam] ? 'components and routing' : 'loose hardware') + ' for ' +
+          FAMILY_LABEL[fam].toLowerCase() + ' with ' + term.toUpperCase() +
+          '\\u2019s? Quantities will need adjusting after.')){
+      return;
+    }
+
+    setHint('dnb-copyFromHint-' + fam, 'Loading ' + term.toUpperCase() + '…', '');
+    var xhr = new XMLHttpRequest();
+    xhr.open('GET', baseUrl() + '&api=partcopy&term=' + encodeURIComponent(term), true);
+    xhr.onload = function(){
+      try {
+        var t = xhr.responseText, s = t.indexOf('{'), e = t.lastIndexOf('}');
+        var r = JSON.parse(t.slice(s, e+1));
+        if (!r.ok){ setHint('dnb-copyFromHint-' + fam, r.message || 'Not found.', 'bad'); return; }
+
+        var comps = r.components || [];
+        var droppedSubs = 0;
+        // The DOOR's own frame/core/screen lines are derived from ITS number
+        // and written by the build, so copying another door's would point this
+        // one at that door's sub-assemblies. Only loose hardware carries over.
+        // Same shape-test the server uses: a family prefix, or a bare 6+ digit
+        // number (a tube frame).
+        if (fam === 'DR'){
+          var before = comps.length;
+          comps = comps.filter(function(c){
+            var n = String(c.itemNumber || '').toUpperCase();
+            return !/^(DR|F|C|S)-[0-9]+-/.test(n) && !/^[0-9]{6,}\$/.test(n);
+          });
+          droppedSubs = before - comps.length;
+        }
+
+        fillFamily(fam, { components: comps, steps: r.steps });
+        refreshNumbers();
+        updatePreview();
+        setHint('dnb-copyFromHint-' + fam,
+          'Filled from ' + r.partNumber + ' — adjust quantities.' +
+          (droppedSubs ? ' ' + droppedSubs + ' sub-assembly line(s) skipped — ' +
+            'this door\\u2019s own are derived from its number.' : ''), 'good');
+      } catch(err){
+        setHint('dnb-copyFromHint-' + fam, 'Unexpected response.', 'bad');
+      }
+    };
+    xhr.onerror = function(){ setHint('dnb-copyFromHint-' + fam, 'Request failed.', 'bad'); };
+    xhr.send();
+  }
+
   // One family's grids from the template's own BOM and routing. A family the
   // template doesn't have (no screen on DR-4000-TEMPLATE) falls back to the
   // built-in catalog default rather than opening empty.
@@ -6047,6 +6171,7 @@ var GNYDNB = (function(){
     loadDoor: loadDoor,
     startCopy: startCopy,
     refill: refill,
+    copyFromPart: copyFromPart,
     openNewTemplate: openNewTemplate,
     closeNewTemplate: closeNewTemplate,
     previewTemplateName: previewTemplateName,
