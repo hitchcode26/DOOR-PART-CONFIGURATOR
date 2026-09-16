@@ -2662,6 +2662,11 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
     const t0 = Date.now();
     const done = [];
     const results = {};
+    // Records this action CREATED, newest-last, so a failure can unwind them.
+    // The door item itself is never in here — it existed before this ran and
+    // must survive a rollback untouched.
+    const created = [];
+    const timer = makeTimer();
     try {
       const doorNumber = String(p.doorNumber || '').trim().toUpperCase();
       let description = String(p.description || '').trim();
@@ -2671,7 +2676,18 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
       // ALL_UNITS, not ALL_FAMILIES — the tube frame is a unit with an item, a
       // BOM, a revision and a routing, and it has to be saved like one.
       const present = ALL_UNITS.filter(f => inbound[f] && inbound[f].itemId);
-      if (!present.length) throw new Error('Nothing loaded. Reload the door and try again.');
+
+      // Families the form wants BUILT rather than updated: a door whose frame
+      // and core items never existed. Filled from a reference door's grids,
+      // then created here from this door's own number. Existing items are
+      // never in this list — an item that is already there is left alone and
+      // only gets a BOM/routing if it is missing one (see updateFamilyUnit).
+      const toCreate = ALL_UNITS.filter(f =>
+        inbound[f] && !inbound[f].itemId && inbound[f].create);
+
+      if (!present.length && !toCreate.length) {
+        throw new Error('Nothing loaded. Reload the door and try again.');
+      }
 
       // Validate everything BEFORE writing anything. A sequence clash found
       // halfway through is a half-saved door.
@@ -2700,8 +2716,117 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
         }
       }
 
+      // A family being created from scratch needs a full set of grids — it is
+      // a build, not an edit, and the same rules the new-door path enforces
+      // apply here for the same reasons.
+      for (const f of toCreate) {
+        const fam = inbound[f];
+        const comps = (fam.components || []).filter(c => c.itemId);
+        if (!comps.length) {
+          throw new Error(FAMILY_LABEL[f] + ' needs at least one component to be built.');
+        }
+        if (CFG.BUILDS_ROUTING[f]) {
+          const steps = (fam.steps || []).filter(s => s.operationName);
+          if (!steps.length) {
+            throw new Error(FAMILY_LABEL[f] + ' needs at least one routing step to be built.');
+          }
+          validateSequences(steps, FAMILY_LABEL[f]);
+        }
+        if (!String(fam.partNumber || '').trim()) {
+          throw new Error('Could not work out a part number for ' + FAMILY_LABEL[f] + '.');
+        }
+      }
+      timer.mark('validate');
+
+      // ── Build the missing sub-assemblies ───────────────────────────────
+      // Item fields are inherited from the REFERENCE door's matching family,
+      // exactly the way "Copy to new door" inherits from its source — a real
+      // sibling is a far closer starting point than a generic template.
+      const newSubLines = {};
+      let tubeItemId = '';
+      if (toCreate.length) {
+        const ref = p.referenceDoor ? resolveDoorItems(p.referenceDoor) : null;
+        const drItemId = (inbound.DR && inbound.DR.itemId) || '';
+        let subsidiaryId = CFG.SUBSIDIARY_ID;
+        if (drItemId) {
+          try {
+            const drItem = record.load({
+              type: record.Type.ASSEMBLY_ITEM, id: drItemId, isDynamic: false
+            });
+            const sv = drItem.getValue({ fieldId: 'subsidiary' });
+            subsidiaryId = (Array.isArray(sv) ? sv[0] : sv) || subsidiaryId;
+          } catch (e) { /* fall back to CFG */ }
+        }
+
+        const refStamp = ref ? templateStamp(ref) : '';
+
+        // The tube goes first when it is being built — the CORE's BOM
+        // consumes it, so the core cannot be built until it has an ID. Same
+        // ordering the new-door path uses, and the same reason.
+        const order = BUILD_ORDER.filter(f => toCreate.indexOf(f) !== -1);
+        for (const f of order) {
+          const fam = inbound[f];
+          const refItemId = (ref && ref.items[f]) ||
+                            (ref && ref.items.F) ||   // screen/tube cost like a frame
+                            '';
+          const defaults = getTemplateDefaultsById(refItemId, refStamp);
+
+          let comps = (fam.components || []).filter(c => c.itemId);
+          if (f === 'C' && tubeItemId) {
+            comps = [{
+              itemId: tubeItemId,
+              quantity: CFG.TUBE_QTY,
+              itemSource: CFG.TUBE_SOURCE
+            }].concat(comps);
+          }
+
+          const built = buildUnit({
+            timer, family: f, created,
+            partNum: String(fam.partNumber).trim().toUpperCase(),
+            description: CFG.DESC_PREFIX[f] + description,
+            defaults: defaults,
+            subsidiaryId: subsidiaryId,
+            locationId: CFG.LOCATION_ID,
+            classId: p.classId,
+            cutDetails: '',     // the cut list lives on the door only
+            doorLine: p.doorLine,
+            purchasePrice: '',  // purchase price lives on the door only
+            components: comps,
+            steps: (fam.steps || []).filter(s => s.operationName),
+            effectiveDate: offsetDate(CFG.EFFECTIVE_DATE_OFFSET_DAYS),
+            revLetter: 'A',
+            autoIssue: p.autoIssue
+          });
+
+          built.createdNew = true;
+          results[f] = built;
+          done.push(FAMILY_LABEL[f] + ' built (' + built.name + ')');
+
+          if (f === 'T') tubeItemId = built.item.id;
+          // The tube hangs off the CORE, never off the door.
+          else newSubLines[f] = { itemId: built.item.id, partNumber: built.name };
+        }
+      }
+
+      // ── Update everything that already existed ─────────────────────────
       for (const f of present) {
         const fam = inbound[f];
+        // Sub-assemblies just created belong on the door's own BOM. They are
+        // appended to the lines the door already had, in the account's usual
+        // order, so the door ends up consuming its whole family.
+        if (f === 'DR' && Object.keys(newSubLines).length) {
+          const existing = (fam.subLines || []).filter(c => c.itemId);
+          const have = {};
+          for (const c of existing) have[String(c.itemId)] = true;
+          const add = [];
+          for (const sub of CFG.DR_COMPONENT_ORDER) {
+            const nl = newSubLines[sub];
+            if (!nl || have[String(nl.itemId)]) continue;
+            add.push({ itemId: nl.itemId, quantity: 1, itemSource: CFG.DR_SUBASSEMBLY_SOURCE });
+          }
+          fam.subLines = add.concat(existing);
+        }
+
         const r = updateFamilyUnit(f, fam, {
           description: CFG.DESC_PREFIX[f] + description,
           classId: p.classId,
@@ -2710,26 +2835,40 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
           purchasePrice: (f === 'DR') ? p.purchasePrice : null,
           autoIssue: p.autoIssue,
           asNewRev: asNewRev,
-          done: done
+          done: done,
+          created: created
         });
         results[f] = r;
       }
 
+      const builtNames = toCreate.map(f => FAMILY_LABEL[f].toLowerCase());
       return {
         ok: true,
         ms: Date.now() - t0,
         doorNumber: doorNumber,
         description: description,
         families: results,
-        message: asNewRev
-          ? doorNumber + ' updated — new revisions opened on ' +
-            present.map(f => FAMILY_LABEL[f].toLowerCase()).join(', ') + '.'
-          : doorNumber + ' updated in place.'
+        builtFamilies: toCreate,
+        message: (builtNames.length
+          ? doorNumber + ' — built ' + builtNames.join(', ') + '. '
+          : '') +
+          (asNewRev
+            ? (present.length
+                ? 'New revisions opened on ' +
+                  present.map(f => FAMILY_LABEL[f].toLowerCase()).join(', ') + '.'
+                : '')
+            : (present.length ? 'Updated in place.' : ''))
       };
 
     } catch (e) {
       log.error({ title: 'updateDoor failed', details: e.toString() + ' | ' + (e.stack || '') });
-      return { ok: false, message: e.message || String(e), alreadySaved: done, families: results };
+      // Anything this action created is unwound; the door item and everything
+      // that already existed is left exactly as it was.
+      const undone = rollback(created);
+      return {
+        ok: false, message: e.message || String(e),
+        alreadySaved: done, families: results, rolledBack: undone
+      };
     }
   }
 
@@ -2788,6 +2927,7 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
       const subsidiaryId = Array.isArray(subVal) ? subVal[0] : subVal;
       const bomName = fam.partNumber + ' BOM';
       const newBomId = createBom(bomName, subsidiaryId);
+      if (o.created) o.created.push({ type: record.Type.BOM, id: newBomId });
       item.setSublistValue({ sublistId: 'billofmaterials', fieldId: 'billofmaterials', line: 0, value: newBomId });
       item.setSublistValue({ sublistId: 'billofmaterials', fieldId: 'masterdefault', line: 0, value: true });
       fam.bomId = newBomId;
@@ -2818,6 +2958,7 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
       routing.setValue({ fieldId: 'isdefault', value: true });
       writeRoutingSteps(routing, steps);
       const routingId = routing.save({ enableSourcing: CFG.ENABLE_SOURCING });
+      if (o.created) o.created.push({ type: record.Type.MANUFACTURING_ROUTING, id: routingId });
       fam.routingId = routingId;
       out.routing = { id: routingId, steps: steps.length, created: true };
       o.done.push(label + ' routing created (' + steps.length + ' step(s))');
@@ -2867,6 +3008,7 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
       rev.setValue({ fieldId: 'effectivestartdate', value: offsetDate(CFG.EFFECTIVE_DATE_OFFSET_DAYS) });
       writeRevisionComponents(rev, components, o.autoIssue);
       const revId = rev.save({ enableSourcing: CFG.ENABLE_SOURCING });
+      if (o.created) o.created.push({ type: record.Type.BOM_REVISION, id: revId });
       out.revision = { id: revId, name: revName, lines: components.length, created: true };
       o.done.push(label + ' revision created (' + components.length + ' line(s))');
       return out;
@@ -3302,7 +3444,7 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
     <div class="fam-num" id="dnb-num-${f}">&nbsp;</div>
     ${extraTop || ''}
 
-    <div class="copy-from-row">
+    <div class="copy-from-row" id="dnb-copyFromRow-${f}">
       <label for="dnb-copyFrom-${f}">Copy BOM/routing from</label>
       <div class="copy-from-inline">
         <input id="dnb-copyFrom-${f}" autocomplete="off" placeholder="a similar part number…">
@@ -3827,7 +3969,7 @@ ${warnBanner}
          setup in from. Only the LOOSE HARDWARE comes across — the door's own
          frame/core/screen lines are re-derived from its number, never copied
          off another door. -->
-    <div class="copy-from-row">
+    <div class="copy-from-row" id="dnb-copyFromRow-DR">
       <label for="dnb-copyFrom-DR">Copy BOM from</label>
       <div class="copy-from-inline">
         <input id="dnb-copyFrom-DR" autocomplete="off" placeholder="a similar door number…">
@@ -4377,6 +4519,13 @@ var GNYDNB = (function(){
     stopCopy();
     mode = 'edit';
     editData = r;
+    // A freshly loaded door starts from what NetSuite actually has — any
+    // pending "build these families" state from a previous reference fill is
+    // no longer about this door.
+    toCreateFamilies = {};
+    referenceDoor = '';
+    var cf = root.querySelectorAll('[id^="dnb-copyFrom-"]');
+    for (var ci=0;ci<cf.length;ci++) cf[ci].value = '';
 
     \$('dnb-series').value = r.series;
     \$('dnb-number').value = r.number;
@@ -4493,6 +4642,7 @@ var GNYDNB = (function(){
     \$('dnb-editBanner').classList.add('open');
 
     refreshNumbers();
+    refreshCopyBoxes();
     updatePreview();
   }
 
@@ -4517,6 +4667,7 @@ var GNYDNB = (function(){
     toggleScreen();
     if (keepNumber) \$('dnb-number').value = keepNumber;
     refreshNumbers();
+    refreshCopyBoxes();
     updatePreview();
   }
 
@@ -4561,6 +4712,7 @@ var GNYDNB = (function(){
     var val = el.value.trim();
     refreshNumbers();
     updatePreview();
+    updateCreateNotice();
     if (!val){ setHint('dnb-tubeHint', '', ''); tubeSetGridsEnabled(true); return; }
 
     var seq = ++tubeReqSeq;
@@ -5174,6 +5326,131 @@ var GNYDNB = (function(){
     updatePreview();
   }
 
+  // Families filled from a reference door that do NOT exist for this door yet
+  // and so must be BUILT on save rather than updated. Cleared whenever a door
+  // is loaded or the form resets.
+  var toCreateFamilies = {};
+  var referenceDoor = '';
+
+  // Pulls a reference door's ENTIRE family setup into the form: the door's own
+  // loose hardware, plus the frame, core, screen and tube grids. Families this
+  // door already has are refilled in place; families it lacks are marked to be
+  // BUILT on save, from this door's own number. That is the whole point — a
+  // door whose sub-assemblies were never set up gets a working family off a
+  // similar door, and the only job left is adjusting quantities.
+  function fillFromReferenceDoor(term){
+    setHint('dnb-copyFromHint-DR', 'Loading ' + term.toUpperCase() + '…', '');
+    var xhr = new XMLHttpRequest();
+    xhr.open('GET', baseUrl() + '&api=loaddoor&term=' + encodeURIComponent(term), true);
+    xhr.onload = function(){
+      var r;
+      try {
+        var t = xhr.responseText, s = t.indexOf('{'), e = t.lastIndexOf('}');
+        r = JSON.parse(t.slice(s, e+1));
+      } catch(err){
+        setHint('dnb-copyFromHint-DR', 'Unexpected response.', 'bad'); return;
+      }
+      if (!r.ok){ setHint('dnb-copyFromHint-DR', r.message || 'Not found.', 'bad'); return; }
+      if (normUp(r.doorNumber) === normUp(editData.doorNumber)){
+        setHint('dnb-copyFromHint-DR', 'That is this door. Pick a different one.', 'bad'); return;
+      }
+
+      referenceDoor = r.doorNumber;
+      toCreateFamilies = {};
+
+      // Mirror the reference: if it carries a screen or a tube, this door gets
+      // one too. Its own checkboxes follow, so the cards come into view.
+      \$('dnb-screen').checked = !!r.families.S;
+      \$('dnb-tube').checked = !!r.families.T;
+
+      var builtList = [], filledList = [];
+
+      for (var i=0;i<ALL_UNITS.length;i++){
+        var fam = ALL_UNITS[i];
+        var ru = r.families[fam];
+        var card = \$('dnb-card-' + fam);
+
+        if (!ru){
+          // Reference hasn't got this family either — leave this door's alone.
+          if (card && fam !== 'DR') card.style.display = editData.families[fam] ? '' : 'none';
+          continue;
+        }
+
+        // The DOOR's own frame/core/screen lines are derived per door, never
+        // copied — only its loose hardware comes across.
+        var comps = (ru.components || []).slice();
+        fillFamily(fam, { components: comps, steps: ru.steps || [] });
+
+        if (card) card.style.display = '';
+
+        if (editData.families[fam]) filledList.push(FAMILY_LABEL[fam].toLowerCase());
+        else { toCreateFamilies[fam] = true; builtList.push(FAMILY_LABEL[fam].toLowerCase()); }
+      }
+
+      // A tube's number is assigned by engineering per door and is never
+      // shared, so the reference's is deliberately not carried over.
+      if (\$('dnb-tube').checked && !editData.families.T){
+        \$('dnb-tubeNumber').value = '';
+        setHint('dnb-tubeHint', 'Enter this door\\u2019s own tube number — the reference\\u2019s ' +
+          'belongs to ' + r.doorNumber + '.', 'bad');
+      }
+
+      refreshNumbers();
+      updatePreview();
+      updateCreateNotice();
+
+      var msg = 'From ' + r.doorNumber + ' — ';
+      if (builtList.length) msg += 'will BUILD ' + builtList.join(', ') + '; ';
+      if (filledList.length) msg += 'refilled ' + filledList.join(', ') + '; ';
+      msg += 'adjust quantities, then Update fields.';
+      setHint('dnb-copyFromHint-DR', msg, 'good');
+    };
+    xhr.onerror = function(){ setHint('dnb-copyFromHint-DR', 'Request failed.', 'bad'); };
+    xhr.send();
+  }
+
+  function normUp(s){ return String(s == null ? '' : s).trim().toUpperCase(); }
+
+  // The copy box exists to fill a family that has nothing to fill it with. A
+  // family that already has a BOM does not need it, and offering it there
+  // invites replacing a real BOM with another part's by accident — so it only
+  // shows where there is genuinely no BOM yet. In new-door mode nothing has a
+  // BOM, so every box shows.
+  function refreshCopyBoxes(){
+    for (var i=0;i<ALL_UNITS.length;i++){
+      var f = ALL_UNITS[i];
+      var row = \$('dnb-copyFromRow-' + f);
+      if (!row) continue;
+      var hasBom = false;
+      if (mode === 'edit' && editData && editData.families[f]){
+        hasBom = !!editData.families[f].bomId;
+      }
+      row.style.display = hasBom ? 'none' : '';
+    }
+  }
+
+  // Says plainly, before anything is saved, which families this save will
+  // CREATE — that is a much bigger action than editing fields and should never
+  // be a surprise.
+  function updateCreateNotice(){
+    var fams = [];
+    for (var k in toCreateFamilies){ if (toCreateFamilies[k]) fams.push(k); }
+    if (!fams.length || mode !== 'edit') return;
+    var names = fams.map(function(f){
+      return (f === 'T')
+        ? (\$('dnb-tubeNumber').value.trim() || 'tube frame')
+        : partNumberFor(f);
+    });
+    \$('dnb-editBanner').textContent =
+      'Update fields will BUILD ' + names.join(', ') + ' for ' + editData.doorNumber +
+      ' — new item, BOM, revision' +
+      (fams.filter(function(f){ return BUILDS_ROUTING[f]; }).length ? ' and routing' : '') +
+      ' for each, from the grids below, and put them on the door\\u2019s BOM. Item fields are ' +
+      'inherited from ' + referenceDoor + '. If any of it fails, everything this creates is ' +
+      'rolled back and ' + editData.doorNumber + ' is left as it is.';
+    \$('dnb-editBanner').classList.add('open');
+  }
+
   // Pulls just the BOM components and routing steps off an existing part and
   // drops them into this family's grids — for a family with no BOM of its
   // own (the tube/frame/core scenario the "no BOM" fix leaves you to fill
@@ -5183,6 +5460,18 @@ var GNYDNB = (function(){
     var el = \$('dnb-copyFrom-' + fam);
     var term = el ? el.value.trim() : '';
     if (!term){ setHint('dnb-copyFromHint-' + fam, 'Enter a part number.', 'bad'); return; }
+
+    // On the DOOR card while editing, this means "set this door up like that
+    // one" — the whole family, not just loose hardware.
+    if (fam === 'DR' && mode === 'edit' && editData){
+      if (gridsAreDirty() &&
+          !window.confirm('Fill every grid from ' + term.toUpperCase() +
+            '? Components and routing below will be replaced.')){
+        return;
+      }
+      fillFromReferenceDoor(term);
+      return;
+    }
 
     if ((rowCount[fam] || (BUILDS_ROUTING[fam] && stepCount[fam])) &&
         !window.confirm('Replace the current ' +
@@ -5617,13 +5906,42 @@ var GNYDNB = (function(){
       doorLine: \$('dnb-doorLine').value.trim(),
       purchasePrice: \$('dnb-purchasePrice').value.trim(),
       autoIssue: \$('dnb-autoIssue').checked,
+      // Where the item fields for any family being BUILT are inherited from.
+      referenceDoor: referenceDoor || '',
       families: {}
     };
 
     for (var i=0;i<ALL_UNITS.length;i++){
       var f = ALL_UNITS[i];
       var u = editData.families[f];
-      if (!u) continue;
+
+      // Families this door does not have yet, filled from a reference door
+      // and flagged to be built on save. They carry no itemId — that is what
+      // tells the server to create rather than update — but they do carry the
+      // part number this door's own number derives, because the server names
+      // every record it builds off it.
+      if (!u){
+        if (!toCreateFamilies[f]) continue;
+        var newPart = (f === 'T')
+          ? \$('dnb-tubeNumber').value.trim().toUpperCase()
+          : partNumberFor(f);
+        if (!newPart){
+          showError(f === 'T'
+            ? 'Enter the tube frame number before saving — engineering assigns it.'
+            : 'Could not work out the part number for ' + FAMILY_LABEL[f].toLowerCase() + '.');
+          return null;
+        }
+        var mk = collectFamily(f);
+        if (!mk) return null;
+        payload.families[f] = {
+          create: true,
+          partNumber: newPart,
+          components: mk.components,
+          steps: mk.steps
+        };
+        continue;
+      }
+
       var got = collectFamily(f);
       if (!got) return null;
       payload.families[f] = {
@@ -5733,7 +6051,21 @@ var GNYDNB = (function(){
     for (var i=0;i<ALL_UNITS.length;i++){
       var f = ALL_UNITS[i], u = r.families[f];
       if (!u) continue;
-      h += '<li>' + esc(u.partNumber);
+      h += '<li>' + esc(u.partNumber || u.name);
+      if (u.createdNew){
+        h += ' &middot; <b>BUILT</b>';
+        if (u.item) h += ' <a href="/app/common/item/item.nl?id=' + u.item.id +
+                         '" target="_blank">item</a>';
+        if (u.bom) h += ' &middot; <a href="/app/manufacturing/billofmaterials.nl?id=' +
+                        u.bom.id + '" target="_blank">BOM</a>';
+        if (u.revision) h += ' &middot; ' + esc(u.revision.name) +
+                             ' (' + u.revision.lines + ' line(s))';
+        if (u.routing) h += ' &middot; <a href="/app/accounting/manufacturing/mfgrouting.nl?id=' +
+                            u.routing.id + '" target="_blank">routing</a> (' +
+                            u.routing.steps + ' step(s))';
+        h += '</li>';
+        continue;
+      }
       if (u.bomCreated){
         h += ' &middot; <a href="/app/manufacturing/billofmaterials.nl?id=' + u.bomCreated.id +
              '" target="_blank">new BOM</a>';
@@ -5953,6 +6285,8 @@ var GNYDNB = (function(){
   function clearForm(){
     mode = 'new';
     editData = null;
+    toCreateFamilies = {};
+    referenceDoor = '';
     numReqSeq++;   // abandon any checkdoor/loaddoor still in flight
     \$('dnb-editBanner').classList.remove('open');
     \$('dnb-doorNote').textContent = DOOR_NOTE_NEW;
@@ -6013,6 +6347,7 @@ var GNYDNB = (function(){
 
     fetchNextNumber();
     refreshNumbers();
+    refreshCopyBoxes();
     updatePreview();
     // Mid-copy the series and the grids are already right and the description
     // is the one thing that changes, so land there instead of at the top.
@@ -6067,6 +6402,7 @@ var GNYDNB = (function(){
 
     renderRecent(false);
     refreshNumbers();
+    refreshCopyBoxes();
     updatePreview();
 
     \$('dnb-template').addEventListener('change', onTemplateChange);
