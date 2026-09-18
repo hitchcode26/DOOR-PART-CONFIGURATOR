@@ -763,7 +763,7 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
       if (api === 'nextnumber')    return { number: nextDoorNumber() };
       if (api === 'checkitem')     return checkItemName(params.term || '');
       if (api === 'checkdoor')     return checkDoorNumber(params.term || '');
-      if (api === 'loaddoor')      return loadDoorForEdit(params.term || '');
+      if (api === 'loaddoor')      return loadDoorForEdit(params.term || '', params.forcopy === '1');
       if (api === 'doors')         return searchDoors(params.term || '');
       if (api === 'partcopy')      return loadPartForCopy(params.term || '');
     } catch (e) {
@@ -1493,7 +1493,7 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
   // ─── EDIT MODE — LOAD ─────────────────────────────────────────────────────
   // Pulls the whole family: for each of DR/F/C/S that exists, its item fields,
   // BOM, current revision, components, and default routing steps.
-  function loadDoorForEdit(term) {
+  function loadDoorForEdit(term, forCopy) {
     const parsed = parseDoorTerm(term);
     if (!parsed) return { ok: false, message: 'Enter a door number.' };
 
@@ -1602,18 +1602,48 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
     }
 
     // Doors built before the tube went on the core still carry it on the DOOR
-    // BOM. Say so rather than quietly showing it as loose hardware — it is the
-    // exact thing this feature exists to stop.
+    // BOM — which is nearly all of them. Two very different jobs here:
+    //
+    //   EDITING that door   leave it exactly where it is and say so. Moving a
+    //                       tube between BOM levels is a change to make
+    //                       deliberately, not a side effect of opening a door.
+    //
+    //   COPYING FROM it     pick it up AS the tube, so the new door gets one
+    //                       built onto its CORE, which is where it belongs.
+    //                       This is how the convention actually spreads: the
+    //                       references all have it on the door, and every door
+    //                       copied off them lands it on the core.
     if (!out.hasTube && dr.components) {
       const strays = dr.components.filter(c =>
         String(c.itemType || '') === 'Assembly' &&
         CFG.TUBE_ON_CORE_PATTERN.test(String(c.itemNumber || '')));
       if (strays.length) {
-        out.tubeOnDoor = strays.map(c => c.itemNumber);
-        out.warnings.push('Tube frame ' + out.tubeOnDoor.join(', ') +
-                          ' is on the DOOR BOM, not the core. It is shown as loose hardware ' +
-                          'below and is left exactly where it is — moving it is a BOM change ' +
-                          'to make deliberately, not a side effect of opening the door.');
+        if (forCopy) {
+          // Taken off the door's lines so it is not ALSO copied across as
+          // loose hardware — it becomes the tube family instead.
+          const strayIds = {};
+          for (const s of strays) strayIds[String(s.itemId)] = true;
+          dr.components = dr.components.filter(c => !strayIds[String(c.itemId)]);
+
+          out.hasTube = true;
+          out.tubeNumber = strays[0].itemNumber;
+          out.tubeFromDoorBom = true;
+          const tUnit = loadFamilyUnit('T', strays[0].itemNumber, strays[0].itemId, out.warnings);
+          if (tUnit) out.families.T = tUnit;
+          out.warnings.push('Tube frame ' + strays[0].itemNumber + ' sits on ' + nums.DR +
+                            '\u2019s own BOM. Copied as a tube frame, so the new door gets ' +
+                            'one on its CORE, which is where it belongs.');
+          if (strays.length > 1) {
+            out.warnings.push(nums.DR + ' carries ' + strays.length +
+                              ' tube-frame lines; only ' + strays[0].itemNumber + ' is copied.');
+          }
+        } else {
+          out.tubeOnDoor = strays.map(c => c.itemNumber);
+          out.warnings.push('Tube frame ' + out.tubeOnDoor.join(', ') +
+                            ' is on the DOOR BOM, not the core. It is shown as loose hardware ' +
+                            'below and is left exactly where it is — moving it is a BOM change ' +
+                            'to make deliberately, not a side effect of opening the door.');
+        }
       }
     }
 
@@ -2811,6 +2841,24 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
       // ── Update everything that already existed ─────────────────────────
       for (const f of present) {
         const fam = inbound[f];
+        // A tube just built belongs on the CORE's BOM. When the core is being
+        // built too, buildUnit already got the line; when the core ALREADY
+        // exists, this is the only place that puts it there — and without it a
+        // tube would be created and then belong to nothing.
+        if (f === 'C' && tubeItemId) {
+          const coreSubs = (fam.subLines || []).filter(c => c.itemId);
+          const already = coreSubs.some(c => String(c.itemId) === String(tubeItemId)) ||
+                          (fam.components || []).some(c => String(c.itemId) === String(tubeItemId));
+          if (!already) {
+            fam.subLines = [{
+              itemId: tubeItemId,
+              quantity: CFG.TUBE_QTY,
+              itemSource: CFG.TUBE_SOURCE
+            }].concat(coreSubs);
+            done.push('Tube frame added to ' + fam.partNumber + '\u2019s BOM');
+          }
+        }
+
         // Sub-assemblies just created belong on the door's own BOM. They are
         // appended to the lines the door already had, in the account's usual
         // order, so the door ends up consuming its whole family.
@@ -4671,6 +4719,18 @@ var GNYDNB = (function(){
     updatePreview();
   }
 
+  // Ticking a family's box on a door that does not have that family is a
+  // request to BUILD it — the same thing a reference copy asks for, and it has
+  // to set the same flag. Without this the family gets filled in on screen,
+  // looks ready to go, and is then silently dropped at save time because
+  // nothing ever marked it for creation.
+  function markFamilyForCreate(fam, on){
+    if (mode !== 'edit' || !editData) return;
+    if (on && !editData.families[fam]) toCreateFamilies[fam] = true;
+    else delete toCreateFamilies[fam];
+    updateCreateNotice();
+  }
+
   function toggleScreen(){
     var on = \$('dnb-screen').checked;
     var card = \$('dnb-card-S');
@@ -4681,6 +4741,7 @@ var GNYDNB = (function(){
       // until an S-4000-TEMPLATE exists.
       fillFamily('S', (templateFill && templateFill.families) ? templateFill.families.S : null);
     }
+    markFamilyForCreate('S', on);
     refreshNumbers();
     updatePreview();
   }
@@ -4696,6 +4757,7 @@ var GNYDNB = (function(){
       fillFamily('T', (templateFill && templateFill.families) ? templateFill.families.T : null);
     }
     if (!on) setHint('dnb-tubeHint', '', '');
+    markFamilyForCreate('T', on);
     refreshNumbers();
     updatePreview();
   }
@@ -5341,7 +5403,7 @@ var GNYDNB = (function(){
   function fillFromReferenceDoor(term){
     setHint('dnb-copyFromHint-DR', 'Loading ' + term.toUpperCase() + '…', '');
     var xhr = new XMLHttpRequest();
-    xhr.open('GET', baseUrl() + '&api=loaddoor&term=' + encodeURIComponent(term), true);
+    xhr.open('GET', baseUrl() + '&api=loaddoor&forcopy=1&term=' + encodeURIComponent(term), true);
     xhr.onload = function(){
       var r;
       try {
@@ -5388,7 +5450,9 @@ var GNYDNB = (function(){
       }
 
       // A tube's number is assigned by engineering per door and is never
-      // shared, so the reference's is deliberately not carried over.
+      // shared, so the reference's is deliberately not carried over. This
+      // applies whether or not the core already exists — the tube is built
+      // fresh and put onto this door's core either way.
       if (\$('dnb-tube').checked && !editData.families.T){
         \$('dnb-tubeNumber').value = '';
         setHint('dnb-tubeHint', 'Enter this door\\u2019s own tube number — the reference\\u2019s ' +
@@ -5445,9 +5509,13 @@ var GNYDNB = (function(){
       'Update fields will BUILD ' + names.join(', ') + ' for ' + editData.doorNumber +
       ' — new item, BOM, revision' +
       (fams.filter(function(f){ return BUILDS_ROUTING[f]; }).length ? ' and routing' : '') +
-      ' for each, from the grids below, and put them on the door\\u2019s BOM. Item fields are ' +
-      'inherited from ' + referenceDoor + '. If any of it fails, everything this creates is ' +
-      'rolled back and ' + editData.doorNumber + ' is left as it is.';
+      ' for each, from the grids below, and put them on the door\\u2019s BOM' +
+      (toCreateFamilies.T
+        ? ' — except the tube frame, which goes on the CORE\\u2019s BOM, which is where it ' +
+          'belongs and where new ones go from now on'
+        : '') +
+      '. Item fields are inherited from ' + referenceDoor + '. If any of it fails, everything ' +
+      'this creates is rolled back and ' + editData.doorNumber + ' is left as it is.';
     \$('dnb-editBanner').classList.add('open');
   }
 
@@ -5921,7 +5989,26 @@ var GNYDNB = (function(){
       // part number this door's own number derives, because the server names
       // every record it builds off it.
       if (!u){
-        if (!toCreateFamilies[f]) continue;
+        if (!toCreateFamilies[f]){
+          // A card that is on screen with components typed into it, but not
+          // marked for creation, means something got out of step. Say so
+          // rather than dropping the work silently the way this used to.
+          var visible = (f === 'S') ? \$('dnb-screen').checked
+                      : (f === 'T') ? \$('dnb-tube').checked : false;
+          if (visible && rowCount[f]){
+            var anyTyped = false;
+            for (var vr=0; vr<rowCount[f]; vr++){
+              var vel = \$('dnb-comp-id-' + f + vr);
+              if (vel && vel.value){ anyTyped = true; break; }
+            }
+            if (anyTyped){
+              showError(FAMILY_LABEL[f] + ' is filled in but was not marked to be built. ' +
+                        'Untick and re-tick its box, then save again.');
+              return null;
+            }
+          }
+          continue;
+        }
         var newPart = (f === 'T')
           ? \$('dnb-tubeNumber').value.trim().toUpperCase()
           : partNumberFor(f);
