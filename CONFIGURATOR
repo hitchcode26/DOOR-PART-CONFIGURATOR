@@ -398,6 +398,25 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
     // to the unused custom field and never showed up anywhere. Same shape as
     // CUT_DETAILS_FIELD otherwise: entered once on the door, never on the
     // sub-assemblies, and now correctly excluded from inheritance below.
+    // WIP on every assembly this tool creates, at the DOOR LOCATION.
+    //
+    // This is a per item-location setting — the WIP column on the item's
+    // Locations sublist, one row per location — NOT an item-level checkbox.
+    // Neither the sublist nor its WIP column is exposed to SuiteQL, so unlike
+    // every other field ID here it could not be confirmed by query. The field
+    // is therefore DISCOVERED off the live record at runtime (any sublist
+    // field matching /wip/), with the names below tried first.
+    //
+    // Only NEW parts this tool creates. Parts that already exist are left
+    // alone, to be handled by a CSV update.
+    //
+    // Applied after the item's own save, because the locations sublist is
+    // populated by NetSuite on create. A failure here logs and carries on —
+    // a checkbox is not worth failing a 15-record build over.
+    SET_WIP: true,
+    WIP_LOCATION_SUBLISTS: ['locations', 'itemlocationconfiguration', 'locationlist'],
+    WIP_FIELDS: ['iswip', 'wip', 'iswipitem', 'wipitem'],
+
     PURCHASE_PRICE_FIELD: 'cost',
 
     // Auto-Issue on BOM revision components. The sublist field ID varies by
@@ -1883,6 +1902,12 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
     created.push({ type: record.Type.ASSEMBLY_ITEM, id: itemId });
     res.item = itemOut.item;
     res.item.id = itemId;
+    // Per item-location setting, so it needs the saved record — see
+    // setLocationWip(). Best-effort: never fails the build.
+    if (CFG.SET_WIP) {
+      res.item.wip = setLocationWip(itemId, o.partNum);
+      if (res.item.wip && res.item.fields) res.item.fields.push('WIP');
+    }
     if (o.timer) o.timer.mark(o.family + '.item');
 
     // BOM revision + components
@@ -1924,6 +1949,84 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
     }
 
     return res;
+  }
+
+  // Ticks WIP for the DOOR LOCATION on a freshly created assembly. This lives
+  // on the item's Locations sublist — one row per location, a WIP column on
+  // each — so it is a sublist write against the row whose location is 48, not
+  // a field on the item itself.
+  //
+  // Neither the sublist ID nor the WIP field ID is exposed to SuiteQL, so both
+  // are discovered off the live record: every sublist in CFG is tried, and
+  // within it any field whose name mentions wip. Whatever works is logged the
+  // first time so the account's real IDs end up on record.
+  //
+  // Best-effort by design. The item, BOM, revision and routing are already
+  // saved by the time this runs, and a missing checkbox is worth a log line,
+  // not a rolled-back door.
+  function setLocationWip(itemId, partNum) {
+    if (!CFG.SET_WIP || !itemId) return false;
+    const wantLoc = String(CFG.LOCATION_ID);
+
+    let item;
+    try {
+      item = record.load({ type: record.Type.ASSEMBLY_ITEM, id: itemId, isDynamic: false });
+    } catch (e) {
+      log.audit({ title: 'WIP: could not reload ' + partNum, details: e.toString() });
+      return false;
+    }
+
+    for (const sublistId of CFG.WIP_LOCATION_SUBLISTS) {
+      let lines = 0;
+      try { lines = item.getLineCount({ sublistId: sublistId }); }
+      catch (e) { continue; }
+      if (lines <= 0) continue;
+
+      // Which field on this sublist is the WIP flag, and which holds the
+      // location. Discovered rather than assumed.
+      let fields = [];
+      try { fields = item.getSublistFields({ sublistId: sublistId }) || []; }
+      catch (e) { fields = []; }
+
+      const wipCandidates = [];
+      for (const f of CFG.WIP_FIELDS) if (fields.indexOf(f) !== -1) wipCandidates.push(f);
+      for (const f of fields) {
+        if (/wip/i.test(f) && wipCandidates.indexOf(f) === -1) wipCandidates.push(f);
+      }
+      if (!wipCandidates.length) continue;
+
+      const locField = ['location', 'locationid', 'loc'].filter(f => fields.indexOf(f) !== -1)[0]
+                       || 'location';
+
+      for (let i = 0; i < lines; i++) {
+        let loc;
+        try { loc = item.getSublistValue({ sublistId: sublistId, fieldId: locField, line: i }); }
+        catch (e) { continue; }
+        if (String(loc) !== wantLoc) continue;
+
+        for (const wf of wipCandidates) {
+          try {
+            item.setSublistValue({ sublistId: sublistId, fieldId: wf, line: i, value: true });
+            const back = item.getSublistValue({ sublistId: sublistId, fieldId: wf, line: i });
+            if (back === true || back === 'T' || back === 'true') {
+              item.save({ ignoreMandatoryFields: true, enableSourcing: CFG.ENABLE_SOURCING });
+              log.audit({
+                title: 'WIP set on ' + partNum,
+                details: sublistId + '.' + wf + ' at location ' + wantLoc + ' (line ' + i + ')'
+              });
+              return true;
+            }
+          } catch (e) { /* not this field */ }
+        }
+      }
+    }
+
+    log.audit({
+      title: 'WIP not set on ' + partNum,
+      details: 'no location row for ' + wantLoc + ' with a settable WIP field — tried sublists ' +
+               CFG.WIP_LOCATION_SUBLISTS.join(', ') + '. Item saved without it.'
+    });
+    return false;
   }
 
   function buildDoor(p) {
@@ -2477,6 +2580,11 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
         catch (e) { log.audit({ title: 'purchase price set failed', details: e.toString() }); }
       }
     }
+
+    // WIP is a per item-LOCATION setting, not an item-level checkbox — it
+    // lives on the Locations sublist, one row per location. So it cannot be
+    // set here during the item's own create; it is applied after the save by
+    // setLocationWip(), against the door location only.
 
     o.out.item = { name: o.partNum, family: o.family, descriptionFields: descFields, fields: applied };
     return item.save({ ignoreMandatoryFields: false, enableSourcing: CFG.ENABLE_SOURCING });
