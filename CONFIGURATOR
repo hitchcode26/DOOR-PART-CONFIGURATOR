@@ -355,9 +355,13 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
     // created by different processes and both are still in use.
     REV_NAME_SEP: { DR: ' BOM REV-', F: ' BOM REV ', C: ' BOM REV ', S: ' BOM REV ', T: ' BOM REV ' },
 
-    // The door itself has no routing. Zero of 3,183 DR items have one — the
-    // work happens on the frame and the core, and the door is the marriage.
-    BUILDS_ROUTING: { DR: false, F: true, C: true, S: true, T: true },
+    // The door now carries a routing of its own: one ASSEMBLY step, where the
+    // frame, core and screen are married together. Zero of 3,183 DR items had
+    // one when this tool was written — the work all happened on the sub-
+    // assemblies — but a CSV has since added the step to the parent parts, so
+    // new doors have to match. 1,305 live steps, every one identical: ASSEMBLY
+    // at sequence 1, Door - Assembly, DR Assembly, run 5 / setup 0.
+    BUILDS_ROUTING: { DR: true, F: true, C: true, S: true, T: true },
 
     // Door numbers are 7 digits and currently run 10xxxxx. Zero-padded to
     // this width when the next number is suggested.
@@ -558,6 +562,13 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
   //   EXT BEND on a core  = DR Core Framing    (430 C)
   // Run rate 5 / setup 0 appears on every one of those 6,307 steps.
   const OPERATIONS = {
+    // The door's own step: the frame, core and screen married together.
+    // Read off the 1,305 live steps the parent-part CSV created — every one
+    // identical, ASSEMBLY at sequence 1, Door - Assembly, DR Assembly,
+    // run 5 / setup 0. Named ASSEMBLY, not ASSEMBLE, to match them exactly.
+    DR: [
+      { op: 'ASSEMBLY', seq: 1, wc: 'Door - Assembly', ct: 'DR Assembly', run: 5, setup: 0 }
+    ],
     F: [
       { op: 'EXT CUT',  seq: 1, wc: 'Door - Core Framing', ct: 'DR Frame Cutting', run: 5, setup: 0 },
       { op: 'EXT WELD', seq: 2, wc: 'Door - Core Framing', ct: 'DR Frame Welding', run: 5, setup: 0 },
@@ -593,6 +604,7 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
   // Which steps a brand new family starts with. The most common live shape,
   // not a guess — rows are added and removed like any other.
   const DEFAULT_STEPS = {
+    DR: ['ASSEMBLY'],
     F: ['EXT CUT', 'EXT WELD'],
     C: ['EXT CUT', 'LAMINATION', 'ROUTING'],
     S: ['EXT CUT'],
@@ -2124,6 +2136,18 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
         validateSequences(steps, FAMILY_LABEL[f]);
       }
 
+      // The door's own routing. Validated separately because `families` holds
+      // the sub-assemblies only, and the door's components are assembled
+      // further down from its sub-assembly lines rather than read off the grid
+      // here — so only the steps can be checked at this point.
+      if (CFG.BUILDS_ROUTING.DR) {
+        const drSteps = ((inbound.DR || {}).steps || []).filter(s => s.operationName);
+        if (!drSteps.length) {
+          throw new Error(FAMILY_LABEL.DR + ' needs at least one routing step.');
+        }
+        validateSequences(drSteps, FAMILY_LABEL.DR);
+      }
+
       timer.mark('validate');
 
       // ── Shared context ─────────────────────────────────────────────────
@@ -2312,7 +2336,9 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
         doorLine: doorLine,
         purchasePrice: purchasePrice,
         components: drComponents,
-        steps: [],           // doors have no routing, by design
+        // The door's own ASSEMBLY step, where the sub-assemblies are married
+        // together. Doors had no routing until the parent-part CSV added one.
+        steps: (drFam.steps || []).filter(st => st.operationName),
         effectiveDate,
         revLetter: p.revLetter,
         revMemo: p.revMemo,
@@ -4115,6 +4141,27 @@ ${warnBanner}
     </div>
     <button type="button" class="btn-add tabstop" onclick="GNYDNB.addComponent('DR', true)">+ Add hardware</button>
 
+    <!-- The door's own routing — one ASSEMBLY step, where the frame, core and
+         screen are married together. Doors carried no routing until the
+         parent-part CSV added one, so this grid is newer than the rest of the
+         card. -->
+    <div class="sub-label" style="margin-top:14px">Routing steps</div>
+    <div class="twrap">
+    <table>
+      <thead><tr>
+        <th class="r" style="width:8%">Seq</th>
+        <th style="width:22%">Operation</th>
+        <th style="width:24%">Work center</th>
+        <th style="width:24%">Cost template</th>
+        <th class="r" style="width:8%">Run</th>
+        <th class="r" style="width:8%">Setup</th>
+        <th style="width:6%"></th>
+      </tr></thead>
+      <tbody id="dnb-stepBody-DR"></tbody>
+    </table>
+    </div>
+    <button type="button" class="btn-add tabstop" onclick="GNYDNB.addStep('DR', true)">+ Add step</button>
+
     <div class="grid g2" style="margin-top:10px;display:none" id="dnb-editRev-DR">
       <div>
         <label for="dnb-newRevName-DR">New BOM rev name</label>
@@ -4225,7 +4272,7 @@ var GNYDNB = (function(){
 
   var root;
   var rowCount = { DR:0, F:0, C:0, S:0, T:0 };
-  var stepCount = { F:0, C:0, S:0, T:0 };
+  var stepCount = { DR:0, F:0, C:0, S:0, T:0 };
   var acTimers = {}, acData = {}, acActive = {}, acQueryCache = {};
 
   // ── mode ────────────────────────────────────────────────────────────────
