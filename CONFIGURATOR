@@ -3056,6 +3056,12 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
       .concat((fam.components || []).filter(c => c.itemId));
     const hadBom = !!fam.bomId;
 
+    // Needed by both the "build a new BOM" step below and the routing-create
+    // step, so it's resolved once, up front, off the item that is already
+    // loaded — no extra query.
+    const subVal = item.getValue({ fieldId: 'subsidiary' });
+    const itemSubsidiary = Array.isArray(subVal) ? subVal[0] : subVal;
+
     // No BOM and nothing on the grid to build one from — not ready yet. Save
     // just the item fields (door line, class, cut details, purchase price)
     // and stop here rather than forcing an empty BOM into existence. Add
@@ -3070,11 +3076,16 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
 
     let builtBom = false;
     if (!hadBom) {
-      const subVal = item.getValue({ fieldId: 'subsidiary' });
-      const subsidiaryId = Array.isArray(subVal) ? subVal[0] : subVal;
       const bomName = fam.partNumber + ' BOM';
-      const newBomId = createBom(bomName, subsidiaryId);
-      if (o.created) o.created.push({ type: record.Type.BOM, id: newBomId });
+      const newBomId = createBom(bomName, itemSubsidiary);
+      // detachFrom: fam.itemId EXISTED before this action ran and is about to
+      // be saved pointing at this new BOM. NetSuite refuses to delete a BOM
+      // that is still attached to an assembly item ("BoM is currently used on
+      // the following assembly items"), so a failure later in this same save
+      // needs rollback to unhook the BOM from the item BEFORE deleting it —
+      // otherwise the BOM is stranded exactly the way BOM 12293 was on
+      // DR-1520-1001651.
+      if (o.created) o.created.push({ type: record.Type.BOM, id: newBomId, detachFrom: fam.itemId });
       item.setSublistValue({ sublistId: 'billofmaterials', fieldId: 'billofmaterials', line: 0, value: newBomId });
       item.setSublistValue({ sublistId: 'billofmaterials', fieldId: 'masterdefault', line: 0, value: true });
       fam.bomId = newBomId;
@@ -3087,22 +3098,45 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
     o.done.push(label + ' item fields');
     out.itemSaved = true;
 
-    if (builtBom && CFG.RESTRICT_BOM_TO_ASSEMBLY) {
-      out.bomCreated.restricted = restrictBomToAssembly(fam.bomId, fam.itemId);
+    // ── 2. First revision — BEFORE the routing ─────────────────────────
+    // Matches buildUnit's own order: BOM -> item -> REVISION -> ROUTING ->
+    // scope. This function used to scope the BOM and build the routing
+    // FIRST, against a BOM that had no revision yet (and, once scoped, was no
+    // longer available to all assemblies either) — NetSuite rejected the
+    // routing's own billofmaterials field:
+    //   "You have entered an Invalid Field Value 12293 for the following
+    //    field: billofmaterials"
+    // Either the BOM is brand new, or it existed with no active revision —
+    // either way there is nothing to update in place, so the first revision
+    // is created here instead of down in step 5.
+    const needsFirstRev = builtBom || !fam.revId;
+    if (needsFirstRev) {
+      const revName = fam.partNumber + CFG.REV_NAME_SEP[f] + 'A';
+      const rev = record.create({ type: record.Type.BOM_REVISION, isDynamic: false });
+      rev.setValue({ fieldId: 'billofmaterials', value: fam.bomId });
+      rev.setValue({ fieldId: 'name', value: revName });
+      rev.setValue({ fieldId: 'effectivestartdate', value: offsetDate(CFG.EFFECTIVE_DATE_OFFSET_DAYS) });
+      writeRevisionComponents(rev, components, o.autoIssue);
+      const revId = rev.save({ enableSourcing: CFG.ENABLE_SOURCING });
+      if (o.created) o.created.push({ type: record.Type.BOM_REVISION, id: revId });
+      out.revision = { id: revId, name: revName, lines: components.length, created: true };
+      o.done.push(label + ' revision created (' + components.length + ' line(s))');
     }
 
-    // ── 2. Routing steps ────────────────────────────────────────────────
+    // ── 3. Routing steps ────────────────────────────────────────────────
     const steps = CFG.BUILDS_ROUTING[f] ? (fam.steps || []).filter(s => s.operationName) : [];
     const newSeqs = steps.map(st => parseInt(st.sequence, 10)).filter(n => !isNaN(n));
 
     if (!fam.routingId && CFG.BUILDS_ROUTING[f] && steps.length) {
-      // No routing existed either — same situation as the missing BOM, so it
-      // gets built the same way a brand-new door's routing would.
+      // No routing existed either — built the same way buildUnit builds one,
+      // subsidiary and location included (this path used to leave both off).
       const routingName = fam.partNumber + ' ROUTING';
       const routing = record.create({ type: record.Type.MANUFACTURING_ROUTING, isDynamic: false });
       routing.setValue({ fieldId: 'name', value: routingName });
       routing.setValue({ fieldId: 'billofmaterials', value: fam.bomId });
       routing.setValue({ fieldId: 'isdefault', value: true });
+      if (itemSubsidiary)  routing.setValue({ fieldId: 'subsidiary', value: itemSubsidiary });
+      if (CFG.LOCATION_ID) routing.setValue({ fieldId: 'location', value: CFG.LOCATION_ID });
       writeRoutingSteps(routing, steps);
       const routingId = routing.save({ enableSourcing: CFG.ENABLE_SOURCING });
       if (o.created) o.created.push({ type: record.Type.MANUFACTURING_ROUTING, id: routingId });
@@ -3135,31 +3169,19 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
       o.done.push(label + ' routing (' + steps.length + ' step(s))');
     }
 
-    // ── 3. Components — new BOM/revision gets a fresh one; existing BOM
-    //      follows the normal in-place / new-revision logic ─────────────
-    // The door's sub-assembly lines are rebuilt from the loaded family rather
-    // than from the grid, so nobody can accidentally drop the frame or core
-    // out of the door by clearing a row. `components` was already computed
-    // above, before the item save, since it decides whether a BOM gets built
-    // at all.
-
-    if (builtBom || !fam.revId) {
-      // Either the BOM itself is brand new, or it existed with no active
-      // revision — either way there is nothing to update in place, so the
-      // first revision is created instead of being skipped.
-      const revLetter = 'A';
-      const revName = fam.partNumber + CFG.REV_NAME_SEP[f] + revLetter;
-      const rev = record.create({ type: record.Type.BOM_REVISION, isDynamic: false });
-      rev.setValue({ fieldId: 'billofmaterials', value: fam.bomId });
-      rev.setValue({ fieldId: 'name', value: revName });
-      rev.setValue({ fieldId: 'effectivestartdate', value: offsetDate(CFG.EFFECTIVE_DATE_OFFSET_DAYS) });
-      writeRevisionComponents(rev, components, o.autoIssue);
-      const revId = rev.save({ enableSourcing: CFG.ENABLE_SOURCING });
-      if (o.created) o.created.push({ type: record.Type.BOM_REVISION, id: revId });
-      out.revision = { id: revId, name: revName, lines: components.length, created: true };
-      o.done.push(label + ' revision created (' + components.length + ' line(s))');
-      return out;
+    // ── 4. Scope the new BOM LAST, same order buildUnit uses ────────────
+    if (builtBom && CFG.RESTRICT_BOM_TO_ASSEMBLY) {
+      out.bomCreated.restricted = restrictBomToAssembly(fam.bomId, fam.itemId);
     }
+
+    // The first revision was already written above with every component on
+    // it — nothing left to do for components on this save.
+    if (needsFirstRev) return out;
+
+    // ── 5. Components — new BOM/revision already handled above; existing
+    //      BOM follows the normal in-place / new-revision logic ─────────
+    // `components` was already computed near the top of this function, before
+    // the item save, since it decides whether a BOM gets built at all.
 
     if (!o.asNewRev) {
       const rev = record.load({ type: record.Type.BOM_REVISION, id: fam.revId, isDynamic: false });
@@ -3297,18 +3319,57 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
   function rollback(created) {
     const undone = [];
     for (let i = created.length - 1; i >= 0; i--) {
+      const c = created[i];
+      // A BOM attached to an item that existed BEFORE this action ran cannot
+      // be deleted while that item still points at it — NetSuite refuses with
+      // "BoM is currently used on the following assembly items". Unhook it
+      // from the item first (see detachFrom, set in updateFamilyUnit).
+      if (c.detachFrom) {
+        if (detachBomFromItem(c.detachFrom, c.id)) {
+          undone.push('BOM ' + c.id + ' unhooked from item ' + c.detachFrom);
+        }
+      }
       try {
-        record.delete({ type: created[i].type, id: created[i].id });
-        undone.push(created[i].type + ' ' + created[i].id);
+        record.delete({ type: c.type, id: c.id });
+        undone.push(c.type + ' ' + c.id);
       } catch (e) {
         log.error({
           title: 'rollback failed',
-          details: created[i].type + ' ' + created[i].id + ': ' + e.toString()
+          details: c.type + ' ' + c.id + ': ' + e.toString()
         });
-        undone.push(created[i].type + ' ' + created[i].id + ' (DELETE FAILED — clean up manually)');
+        undone.push(c.type + ' ' + c.id + ' (DELETE FAILED — clean up manually)');
       }
     }
     return undone;
+  }
+
+  // Removes every Bill of Materials line on itemId that points at bomId, then
+  // saves. Returns true only if a line was actually found and removed — if
+  // the item save that attached the BOM never happened (an earlier failure),
+  // there is nothing here to undo and the caller should not report a fake
+  // success.
+  function detachBomFromItem(itemId, bomId) {
+    try {
+      const item = record.load({ type: record.Type.ASSEMBLY_ITEM, id: itemId, isDynamic: false });
+      const n = item.getLineCount({ sublistId: 'billofmaterials' });
+      let removed = 0;
+      for (let i = n - 1; i >= 0; i--) {
+        const b = item.getSublistValue({ sublistId: 'billofmaterials', fieldId: 'billofmaterials', line: i });
+        if (String(b) === String(bomId)) {
+          item.removeLine({ sublistId: 'billofmaterials', line: i });
+          removed++;
+        }
+      }
+      if (!removed) return false;
+      item.save({ ignoreMandatoryFields: true, enableSourcing: CFG.ENABLE_SOURCING });
+      return true;
+    } catch (e) {
+      log.error({
+        title: 'rollback — BOM detach failed',
+        details: 'item ' + itemId + ' / BOM ' + bomId + ': ' + e.toString()
+      });
+      return false;
+    }
   }
 
   // ─── TEMPLATE ITEM DEFAULTS ───────────────────────────────────────────────
@@ -6176,7 +6237,7 @@ var GNYDNB = (function(){
     btn.disabled = true; btn.textContent = 'Saving…'; revBtn.disabled = true;
     postJson(payload, function(r){
       btn.disabled = false; btn.textContent = 'Update fields'; revBtn.disabled = false;
-      if (r.ok) showEditSuccess(r); else showError(r.message, null, r.alreadySaved);
+      if (r.ok) showEditSuccess(r); else showError(r.message, r.rolledBack, r.alreadySaved);
     });
   }
 
@@ -6194,7 +6255,7 @@ var GNYDNB = (function(){
     btn.disabled = true; revBtn.disabled = true; revBtn.textContent = 'Saving…';
     postJson(payload, function(r){
       btn.disabled = false; revBtn.disabled = false; revBtn.textContent = 'Save as new BOM revisions';
-      if (r.ok) showEditSuccess(r); else showError(r.message, null, r.alreadySaved);
+      if (r.ok) showEditSuccess(r); else showError(r.message, r.rolledBack, r.alreadySaved);
     });
   }
 
