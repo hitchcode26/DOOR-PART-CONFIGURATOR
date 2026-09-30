@@ -311,7 +311,7 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
     // scope with an hour TTL, so a corrected query keeps serving the OLD
     // result until the TTL expires.
     USE_CACHE: true,
-    CACHE_NAME: 'gny_dnb_v1',
+    CACHE_NAME: 'gny_dnb_v2',
     CACHE_TTL_LISTS: 3600,
     CACHE_TTL_TEMPLATE: 1800,
 
@@ -434,6 +434,9 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
     WIP_FIELD: 'iswip',
 
     PURCHASE_PRICE_FIELD: 'cost',
+    // Written alongside Purchase Price, the same fields a UI edit changes, and
+    // never inherited from a source door or template (see SKIP_FIELDS).
+    PURCHASE_PRICE_MIRROR_FIELDS: ['fxcost', 'custitemadv_purchaseprice'],
 
     // Auto-Issue on BOM revision components. The sublist field ID varies by
     // account; candidates are tried in order and the one that sticks is
@@ -471,7 +474,11 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
       // real Purchase Price field (see PURCHASE_PRICE_FIELD above) — leaving
       // it off this list is exactly what let a source door's old price
       // silently ride onto every copy regardless of what was typed.
-      'custitemcut_details', 'custitem_door_line', 'cost'
+      'custitemcut_details', 'custitem_door_line', 'cost',
+      // The ADV and foreign-currency copies of Purchase Price. Left off this
+      // list, a copy carried the SOURCE door's price onto the new door -
+      // DR-4500-1002458 got DR-4500-1001031's 332.43 this way.
+      'fxcost', 'custitemadv_purchaseprice'
     ],
 
     // Door work centers are entity GROUPS with grouptype 'Employee' — the
@@ -2237,7 +2244,10 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
 
       const cutDetails = String(p.cutDetails == null ? '' : p.cutDetails);
       const doorLine = p.doorLine ? String(p.doorLine).trim() : '';
-      const purchasePrice = p.purchasePrice != null ? String(p.purchasePrice).trim() : '';
+      // Parsed before a single record exists, so a bad price fails the build
+      // cleanly instead of being skipped. '' = none entered.
+      const ppParsed = parsePrice(p.purchasePrice);
+      const purchasePrice = ppParsed === null ? '' : String(ppParsed);
 
       // ── 1. The tube frame, before anything else ────────────────────────
       // It goes first because the CORE's BOM consumes it, and the core cannot
@@ -2562,12 +2572,12 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
       try { item.setValue({ fieldId: CFG.DOOR_LINE_FIELD, value: o.doorLine }); applied.push('door line'); }
       catch (e) { log.audit({ title: 'door line set failed', details: e.toString() }); }
     }
+    let ppWanted = null;
     if (o.purchasePrice && CFG.PURCHASE_PRICE_FIELD) {
-      const pp = parseFloat(o.purchasePrice);
-      if (!isNaN(pp)) {
-        try { item.setValue({ fieldId: CFG.PURCHASE_PRICE_FIELD, value: pp }); applied.push('purchase price'); }
-        catch (e) { log.audit({ title: 'purchase price set failed', details: e.toString() }); }
-      }
+      ppWanted = parsePrice(o.purchasePrice);
+      // No try/catch on purpose: if Purchase Price will not take the value,
+      // the build fails and rolls back instead of saving a door with no price.
+      if (ppWanted !== null) { setPurchasePrice(item, ppWanted); applied.push('purchase price'); }
     }
 
     // WIP last, alongside the other explicit writes, so a template value can
@@ -2577,7 +2587,81 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
     if (wip.set) applied.push('WIP');
 
     o.out.item = { name: o.partNum, family: o.family, descriptionFields: descFields, fields: applied };
-    return item.save({ ignoreMandatoryFields: false, enableSourcing: CFG.ENABLE_SOURCING });
+    const savedId = item.save({ ignoreMandatoryFields: false, enableSourcing: CFG.ENABLE_SOURCING });
+    // Read back off the SAVED record - the only proof the price landed.
+    if (ppWanted !== null) o.out.item.purchasePrice = verifyPurchasePrice(savedId, ppWanted, o.partNum);
+    return savedId;
+  }
+
+  // ─── PURCHASE PRICE ───────────────────────────────────────────────────────
+  // "$1,234.56" -> 1234.56. Blank -> null (none entered). Anything else that
+  // is not a non-negative number throws - never a silent skip.
+  function parsePrice(raw) {
+    const s = String(raw == null ? '' : raw).replace(/[$,\s]/g, '');
+    if (!s) return null;
+    const n = Number(s);
+    if (!isFinite(n) || n < 0) {
+      throw new Error('Purchase price "' + raw + '" is not a valid amount. Nothing was saved.');
+    }
+    return Math.round(n * 100) / 100;
+  }
+
+  // Purchase Price (cost) must take the value - that one throws. The mirrors
+  // are best-effort, logged if a form hides them.
+  function setPurchasePrice(item, pp) {
+    item.setValue({ fieldId: CFG.PURCHASE_PRICE_FIELD, value: pp });
+    for (const f of (CFG.PURCHASE_PRICE_MIRROR_FIELDS || [])) {
+      try { item.setValue({ fieldId: f, value: pp }); }
+      catch (e) { log.audit({ title: 'purchase price mirror skipped', details: f + ': ' + e.toString() }); }
+    }
+  }
+
+  // Reads cost back off the saved record. If the save dropped it, one retry
+  // with submitFields. Returns { ok, value, retried, note } for the result
+  // screen, so a missing price is shown instead of discovered later.
+  function verifyPurchasePrice(itemId, pp, partNum) {
+    const readBack = () => {
+      try {
+        const r = record.load({ type: record.Type.ASSEMBLY_ITEM, id: itemId, isDynamic: false });
+        return parseFloat(r.getValue({ fieldId: CFG.PURCHASE_PRICE_FIELD }));
+      } catch (e) { return NaN; }
+    };
+    const same = v => !isNaN(v) && Math.abs(v - pp) < 0.005;
+
+    let got = readBack();
+    if (same(got)) return { ok: true, value: pp, retried: false };
+
+    log.audit({
+      title: 'purchase price did not stick on ' + partNum,
+      details: 'wanted ' + pp + ', read back ' + got + ' - retrying'
+    });
+    const values = {};
+    values[CFG.PURCHASE_PRICE_FIELD] = pp;
+    try {
+      record.submitFields({
+        type: record.Type.ASSEMBLY_ITEM, id: itemId, values: values,
+        options: { enableSourcing: false, ignoreMandatoryFields: true }
+      });
+    } catch (e) {
+      log.error({ title: 'purchase price retry failed on ' + partNum, details: e.toString() });
+      return { ok: false, value: pp, retried: true, note: 'retry failed: ' + (e.message || e) };
+    }
+    for (const f of (CFG.PURCHASE_PRICE_MIRROR_FIELDS || [])) {
+      const mv = {}; mv[f] = pp;
+      try {
+        record.submitFields({ type: record.Type.ASSEMBLY_ITEM, id: itemId, values: mv,
+                              options: { enableSourcing: false, ignoreMandatoryFields: true } });
+      } catch (e) { log.audit({ title: 'purchase price mirror retry skipped', details: f + ': ' + e.toString() }); }
+    }
+
+    got = readBack();
+    if (same(got)) return { ok: true, value: pp, retried: true };
+    log.error({
+      title: 'purchase price STILL missing on ' + partNum,
+      details: 'wanted ' + pp + ', NetSuite kept ' + (isNaN(got) ? 'blank' : got)
+    });
+    return { ok: false, value: pp, retried: true,
+             note: 'wanted ' + pp + ', NetSuite kept ' + (isNaN(got) ? 'blank' : got) };
   }
 
   // Created available to all assemblies so it's immediately valid to attach to
@@ -2799,6 +2883,9 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
       const doorNumber = String(p.doorNumber || '').trim().toUpperCase();
       let description = String(p.description || '').trim();
       if (!description) throw new Error('Description is required.');
+
+      // Fail on a bad price before anything is written.
+      parsePrice(p.purchasePrice);
 
       const inbound = p.families || {};
       // ALL_UNITS, not ALL_FAMILIES — the tube frame is a unit with an item, a
@@ -3036,12 +3123,11 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
     if (o.doorLine && CFG.DOOR_LINE_FIELD) {
       try { item.setValue({ fieldId: CFG.DOOR_LINE_FIELD, value: o.doorLine }); } catch (e) { /* n/a */ }
     }
+    let ppWanted = null;
     if (o.purchasePrice !== null && o.purchasePrice !== undefined && o.purchasePrice !== '' &&
         CFG.PURCHASE_PRICE_FIELD) {
-      const pp = parseFloat(o.purchasePrice);
-      if (!isNaN(pp)) {
-        try { item.setValue({ fieldId: CFG.PURCHASE_PRICE_FIELD, value: pp }); } catch (e) { /* n/a */ }
-      }
+      ppWanted = parsePrice(o.purchasePrice);
+      if (ppWanted !== null) setPurchasePrice(item, ppWanted);
     }
 
     // A family loaded with no BOM at all (item exists, nothing attached) gets
@@ -3069,6 +3155,7 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
     if (!hadBom && !components.length) {
       item.save({ ignoreMandatoryFields: false, enableSourcing: CFG.ENABLE_SOURCING });
       o.done.push(label + ' item fields (no BOM yet — add components to build one)');
+      if (ppWanted !== null) out.purchasePrice = verifyPurchasePrice(fam.itemId, ppWanted, fam.partNumber);
       out.itemSaved = true;
       out.revision = { skipped: true, reason: 'no BOM and no components to build one from' };
       return out;
@@ -3096,6 +3183,7 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/log', 'N/form
 
     item.save({ ignoreMandatoryFields: false, enableSourcing: CFG.ENABLE_SOURCING });
     o.done.push(label + ' item fields');
+    if (ppWanted !== null) out.purchasePrice = verifyPurchasePrice(fam.itemId, ppWanted, fam.partNumber);
     out.itemSaved = true;
 
     // ── 2. First revision — BEFORE the routing ─────────────────────────
@@ -5288,7 +5376,9 @@ var GNYDNB = (function(){
                      .replace(/^\\s*TEMPLATE\\s*[-:]?\\s*/i, '').trim(),
       cutDetails: editData.cutDetails || '',
       doorLine: editData.doorLine || '',
-      purchasePrice: editData.purchasePrice || '',
+      // Never carried onto a copy: every door has its own price, and a blank
+      // box is the only way a missed one gets noticed.
+      purchasePrice: '',
       hasScreen: !!editData.families.S,
       // The tube's GRIDS carry over, its NUMBER never does. Engineering issues
       // one number per tube and every door gets its own, so reusing the source
@@ -6091,6 +6181,21 @@ var GNYDNB = (function(){
     if (!number){ showError('Enter a door number.'); return; }
     if (!desc){ showError('Enter a description.'); return; }
 
+    // A bad price is stopped here, and a blank one has to be confirmed, so a
+    // door can no longer go out without a price by accident.
+    var ppRaw = \$('dnb-purchasePrice').value.trim();
+    var ppClean = ppRaw.replace(/[$,\\s]/g, '');
+    if (ppClean && (!isFinite(Number(ppClean)) || Number(ppClean) < 0)){
+      showError('Purchase price "' + ppRaw + '" is not a valid amount.');
+      \$('dnb-purchasePrice').focus();
+      return;
+    }
+    if (!ppClean && !window.confirm('No purchase price entered for ' + partNumberFor('DR') +
+        '. Create it without one?')){
+      \$('dnb-purchasePrice').focus();
+      return;
+    }
+
     var payload = {
       action: 'build',
       // The server re-resolves both of these rather than trusting item IDs
@@ -6288,6 +6393,19 @@ var GNYDNB = (function(){
            '</li>';
     }
     h += '</ul>';
+    var ppInfo = (r.families && r.families.DR && r.families.DR.item)
+      ? r.families.DR.item.purchasePrice : null;
+    if (ppInfo && ppInfo.ok){
+      h += '<div style="font-family:var(--dnb-mono);font-size:11px;color:var(--dnb-teal)">' +
+           'Purchase price ' + esc(ppInfo.value) + ' saved and verified' +
+           (ppInfo.retried ? ' (took a second write)' : '') + '</div>';
+    } else if (ppInfo){
+      h += '<div style="font-family:var(--dnb-mono);font-size:12px;color:var(--dnb-red);font-weight:600">' +
+           'PURCHASE PRICE DID NOT SAVE - ' + esc(ppInfo.note || '') + '. Set it on the item record.</div>';
+    } else if (!r.asTemplate){
+      h += '<div style="font-family:var(--dnb-mono);font-size:11px;color:var(--dnb-amber)">' +
+           'No purchase price entered.</div>';
+    }
     if (r.templateUsed){
       h += '<div class="dim" style="font-family:var(--dnb-mono);font-size:10px">' +
            'Item fields inherited from ' + esc(r.templateUsed) + '</div>';
@@ -6347,6 +6465,12 @@ var GNYDNB = (function(){
         h += ' &middot; ' + revWord + esc(u.revision.name) +
              ' (' + u.revision.lines + ' line(s))';
         if (u.revision.note) h += ' <span class="dim">' + esc(u.revision.note) + '</span>';
+      }
+      if (u.purchasePrice){
+        h += u.purchasePrice.ok
+          ? ' &middot; purchase price ' + esc(u.purchasePrice.value) + ' saved'
+          : ' &middot; <b style="color:var(--dnb-red)">PURCHASE PRICE DID NOT SAVE - ' +
+            esc(u.purchasePrice.note || '') + '</b>';
       }
       if (u.routing){
         h += ' &middot; routing ' + (u.routing.created ? 'created, ' : '') + u.routing.steps + ' step(s)';
